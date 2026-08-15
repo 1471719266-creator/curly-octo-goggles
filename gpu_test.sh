@@ -16,6 +16,7 @@ RAW_DATA_DIR="${OUTPUT_DIR}/raw_data"
 CUDA_VERSION="12.6.1"  # 支持 H100/B200/B300 等最新GPU的稳定CUDA版本
 DCGM_VERSION="3.4.1"
 STRESS_DURATION_SEC=60   # 压力测试时长(秒)，售后服务建议60~300秒
+FIELD_LEVEL=2            # fieldiag 原厂现场诊断级别: 1=快速(5~15分钟) 2=中等(约4小时) 3=完整(约6小时)
 
 # 颜色输出
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
@@ -867,6 +868,149 @@ test_dcgm() {
 }
 
 # =========================================
+# 11.5 NVIDIA fieldiag 原厂现场诊断（Field Diagnostics）
+#   fieldiag 是 NVIDIA 原厂现场工程师专用诊断工具，
+#   比dcgmi diag更深入，覆盖存储/计算/PCIe/NVLink全子系统。
+#   该工具通过NVIDIA企业合作伙伴渠道获取，不公开下载。
+#   脚本自动检测常见安装路径，找不到时输出获取指引。
+# =========================================
+test_fieldiag() {
+    log_info "========== 11.5 NVIDIA fieldiag 原厂现场诊断（Level ${FIELD_LEVEL}） =========="
+
+    # 搜索 fieldiag 二进制（常见安装路径）
+    local fieldiag_bin=""
+    for p in \
+        /usr/local/cuda/bin/fieldiag \
+        /usr/local/cuda/bin/nvidia-fieldiag \
+        /opt/nvidia/fieldiag \
+        /opt/nvidia/fieldiag/bin/fieldiag \
+        /usr/bin/fieldiag \
+        /usr/bin/nvidia-fieldiag \
+        "${SCRIPT_DIR}/fieldiag" \
+        "${SCRIPT_DIR}/tools/fieldiag"
+    do
+        if [ -x "${p}" ]; then fieldiag_bin="${p}"; break; fi
+    done
+    # 也搜索PATH
+    if [ -z "${fieldiag_bin}" ]; then
+        fieldiag_bin=$(command -v fieldiag 2>/dev/null || command -v nvidia-fieldiag 2>/dev/null || true)
+    fi
+
+    if [ -z "${fieldiag_bin}" ]; then
+        echo ""
+        log_warn "fieldiag 未安装，跳过原厂现场诊断"
+        log_warn "fieldiag 是 NVIDIA 原厂现场工程师专用诊断工具，比 dcgmi diag 更深入"
+        log_warn "获取方式（按优先级）："
+        log_warn "  1. NVIDIA 企业合作伙伴门户: https://partner.nvidia.com → 下载中心 → 诊断工具"
+        log_warn "  2. NVIDIA 开发者门户: https://developer.nvidia.com → 数据中心GPU管理工具"
+        log_warn "  3. 联系 NVIDIA 技术支持（需提供GPU序列号和保修信息）"
+        log_warn "获取后放置到以下任一路径，重新运行脚本即可自动识别："
+        log_warn "  /usr/local/cuda/bin/fieldiag"
+        log_warn "  /opt/nvidia/fieldiag"
+        log_warn "  ${SCRIPT_DIR}/fieldiag（与本脚本同目录）"
+        # 写入结果标记，报告生成器会识别
+        echo "NOT_INSTALLED" > "${RAW_DATA_DIR}/fieldiag_result.txt"
+        echo "fieldiag 未安装，Level ${FIELD_LEVEL} 诊断跳过" > "${RAW_DATA_DIR}/fieldiag_diag.txt"
+        return
+    fi
+
+    log_ok "找到 fieldiag: ${fieldiag_bin}"
+
+    # 根据 FIELD_LEVEL 确定参数和超时
+    local fieldiag_args=""
+    local fieldiag_timeout=21600
+    local test_level_desc=""
+
+    case "${FIELD_LEVEL}" in
+        1)
+            log_info "Field Diagnostics 级别: 1（快速测试）"
+            log_info "预计耗时: 约 5~15 分钟"
+            # 不同版本fieldiag参数兼容
+            if "${fieldiag_bin}" --help 2>&1 | grep -q -- "--level1"; then
+                fieldiag_args="--no_bmc --level1"
+            elif "${fieldiag_bin}" --help 2>&1 | grep -q -- "--field"; then
+                fieldiag_args="--field --quick"
+            else
+                fieldiag_args="p0only device=1"
+            fi
+            fieldiag_timeout=1800
+            test_level_desc="Level 1 (快速)"
+            ;;
+        2)
+            log_info "Field Diagnostics 级别: 2（中等深度）"
+            log_info "预计耗时: 约 4 小时"
+            if "${fieldiag_bin}" --help 2>&1 | grep -q -- "--level2"; then
+                fieldiag_args="--no_bmc --level2"
+            elif "${fieldiag_bin}" --help 2>&1 | grep -q -- "--field"; then
+                fieldiag_args="--field"
+            else
+                fieldiag_args="p0only"
+            fi
+            fieldiag_timeout=14400
+            test_level_desc="Level 2 (中等)"
+            ;;
+        3)
+            log_info "Field Diagnostics 级别: 3（完整诊断）"
+            log_info "预计耗时: 约 6 小时"
+            if "${fieldiag_bin}" --help 2>&1 | grep -q -- "--level3"; then
+                fieldiag_args="--no_bmc --level3"
+            else
+                fieldiag_args=""
+            fi
+            fieldiag_timeout=21600
+            test_level_desc="Level 3 (完整)"
+            ;;
+        *)
+            log_warn "未知 FIELD_LEVEL=${FIELD_LEVEL}，使用默认 Level 2"
+            FIELD_LEVEL=2
+            fieldiag_args="--no_bmc --level2"
+            fieldiag_timeout=14400
+            test_level_desc="Level 2 (中等, 默认)"
+            ;;
+    esac
+
+    # 保存级别信息
+    echo "${test_level_desc}" > "${RAW_DATA_DIR}/fieldiag_level.txt"
+
+    # 启动后台温度监控（长时间诊断必须监控温度）
+    log_info "启动 nvidia-smi 后台监控（fieldiag 诊断期间）..."
+    nvidia-smi --query-gpu=timestamp,index,name,temperature.gpu,power.draw,utilization.gpu,memory.used \
+        --format=csv -l 5 -f "${RAW_DATA_DIR}/gpu_monitor_fieldiag.csv" &
+    local monitor_pid=$!
+
+    # 运行 fieldiag（带超时保护）
+    log_info "开始执行 fieldiag（超时: ${fieldiag_timeout}秒）..."
+    log_info "命令: ${fieldiag_bin} ${fieldiag_args}"
+
+    local field_start=$(date +%s)
+    timeout "${fieldiag_timeout}" bash -c "${fieldiag_bin} ${fieldiag_args}" > "${RAW_DATA_DIR}/fieldiag_diag.txt" 2>&1
+    local field_ret=$?
+    local field_end=$(date +%s)
+    local field_elapsed=$(( field_end - field_start ))
+    local field_elapsed_fmt=$(printf '%dh%dm%ds' $((field_elapsed/3600)) $(((field_elapsed%3600)/60)) $((field_elapsed%60)))
+    echo "耗时: ${field_elapsed_fmt}" >> "${RAW_DATA_DIR}/fieldiag_diag.txt"
+    echo "返回码: ${field_ret}" >> "${RAW_DATA_DIR}/fieldiag_diag.txt"
+
+    # 停止监控
+    kill "${monitor_pid}" 2>/dev/null; wait "${monitor_pid}" 2>/dev/null
+
+    # 判定结果
+    if [ ${field_ret} -eq 0 ]; then
+        log_ok "fieldiag ${test_level_desc} 诊断通过 (耗时: ${field_elapsed_fmt})"
+        echo "PASS" > "${RAW_DATA_DIR}/fieldiag_result.txt"
+    elif [ ${field_ret} -eq 124 ]; then
+        log_warn "fieldiag 超时（>${fieldiag_timeout}秒），可能需要降低级别或检查GPU负载"
+        echo "TIMEOUT" > "${RAW_DATA_DIR}/fieldiag_result.txt"
+    else
+        log_error "fieldiag 诊断未通过 (返回码=${field_ret}, 耗时: ${field_elapsed_fmt})"
+        log_error "请查看原始输出: ${RAW_DATA_DIR}/fieldiag_diag.txt"
+        echo "FAIL" > "${RAW_DATA_DIR}/fieldiag_result.txt"
+    fi
+
+    log_ok "fieldiag 原厂现场诊断完成"
+}
+
+# =========================================
 # 12. ECC 错误检查（数据中心GPU关键项）
 # =========================================
 test_ecc() {
@@ -1121,6 +1265,13 @@ main() {
         case "${arg}" in
             --skip-install) skip_install=true ;;
             --stress-only)  stress_only=true  ;;
+            --field-level)  shift_next_field_level=true ;;
+            *)
+                if [ "${shift_next_field_level}" = "true" ]; then
+                    FIELD_LEVEL="${arg}"
+                    shift_next_field_level=false
+                fi
+                ;;
             -h|--help)
                 cat <<EOF
 NVIDIA GPU 售后服务自动化测试脚本
@@ -1129,9 +1280,13 @@ NVIDIA GPU 售后服务自动化测试脚本
   sudo bash $0 [选项]
 
 选项:
-  --skip-install    跳过驱动/CUDA/DCGM安装，直接运行测试
-  --stress-only     仅运行压力测试，快速查验温度/功耗
-  -h, --help        显示此帮助
+  --skip-install       跳过驱动/CUDA/DCGM安装，直接运行测试
+  --stress-only        仅运行压力测试，快速查验温度/功耗
+  --field-level N      NVIDIA fieldiag 原厂现场诊断级别:
+                         1 = 快速测试 (约5~15分钟)
+                         2 = 中等深度 (约4小时)
+                         3 = 完整诊断 (约6小时)
+  -h, --help           显示此帮助
 
 输出目录:
   ${SCRIPT_DIR}/gpu_test_results_YYYYMMDD_HHMMSS/
@@ -1139,6 +1294,7 @@ NVIDIA GPU 售后服务自动化测试脚本
     ├── report_data.json         (结构化原始数据)
     ├── test.log                 (完整运行日志)
     ├── cuda_samples_bin/        (编译后的官方测试工具)
+    ├── factory_tools_bin/       (原厂+第三方质检工具)
     └── raw_data/                (所有原始测试输出)
 EOF
                 exit 0
@@ -1193,6 +1349,7 @@ EOF
     test_cuda_perf            # 9. 计算性能
     test_stress_thermal       # 10. 温度功耗压力
     test_dcgm                 # 11. DCGM 完整诊断
+    test_fieldiag             # 11.5 fieldiag 原厂现场诊断
 
     # ============== 生成报告 ==============
     generate_final_report   # 15.

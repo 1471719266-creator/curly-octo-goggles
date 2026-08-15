@@ -385,6 +385,48 @@ def parse_device_query(dq_path: Path) -> Dict[str, Any]:
     return result
 
 
+def parse_fieldiag(result_path: Path, diag_path: Path, level_path: Path) -> Dict[str, Any]:
+    """解析 NVIDIA fieldiag 原厂现场诊断结果"""
+    result_text = safe_read(result_path).strip()
+    diag_text = safe_read(diag_path)
+    level_text = safe_read(level_path).strip()
+
+    result: Dict[str, Any] = {
+        "installed": result_text != "NOT_INSTALLED" and bool(result_text),
+        "result": result_text or "N/A",
+        "level": level_text or "N/A",
+        "raw": diag_text[:10000],
+        "passed": False,
+        "errors": [],
+    }
+
+    if result_text == "PASS":
+        result["passed"] = True
+    elif result_text == "FAIL":
+        result["passed"] = False
+        # 提取错误行
+        for line in diag_text.splitlines():
+            low = line.lower()
+            if any(kw in low for kw in ["fail", "error", "abort", "fatal"]):
+                if "no error" not in low:
+                    result["errors"].append(line.strip())
+    elif result_text == "TIMEOUT":
+        result["passed"] = False
+        result["errors"].append("fieldiag 诊断超时")
+    elif result_text == "NOT_INSTALLED":
+        result["passed"] = True  # 未安装不算失败，不影响整体判定
+        result["installed"] = False
+
+    # 提取耗时
+    for line in diag_text.splitlines():
+        if line.startswith("耗时"):
+            result["duration"] = line.replace("耗时: ", "").strip()
+        elif line.startswith("返回码"):
+            result["return_code"] = line.replace("返回码: ", "").strip()
+
+    return result
+
+
 def parse_dcgm_diag(diag_path: Path) -> Dict[str, Any]:
     text = safe_read(diag_path)
     result: Dict[str, Any] = {"raw": text[:10000]}
@@ -757,6 +799,15 @@ def determine_pass_fail(data: Dict[str, Any]) -> Tuple[bool, List[str]]:
                 for e in errors[:5]:
                     issues.append(f"{label}   └ {e}")
 
+    # --- fieldiag 原厂现场诊断（全局判定，不按GPU分） ---
+    fieldiag = data.get("fieldiag", {})
+    if fieldiag and fieldiag.get("installed"):
+        if not fieldiag.get("passed", True):
+            errors = fieldiag.get("errors", [])
+            issues.append(f"fieldiag {fieldiag.get('level','')} 诊断未通过（NVIDIA原厂现场诊断，【需RMA或联系原厂支持】）")
+            for e in errors[:10]:
+                issues.append(f"  └ {e}")
+
     return (len(issues) == 0), issues
 
 
@@ -858,6 +909,13 @@ def build_data(output_dir: Path, raw_dir: Path, log_file: Path) -> Dict[str, Any
     data["dcgm_diag"] = parse_dcgm_diag(raw_dir / "dcgmi_diag_full.txt")
     data["dcgm_health"] = safe_read(raw_dir / "dcgmi_health.txt")[:4000]
     data["dcgm_stats"] = safe_read(raw_dir / "dcgmi_stats.txt")[:6000]
+
+    # fieldiag 原厂现场诊断
+    data["fieldiag"] = parse_fieldiag(
+        raw_dir / "fieldiag_result.txt",
+        raw_dir / "fieldiag_diag.txt",
+        raw_dir / "fieldiag_level.txt",
+    )
 
     # ===== 原厂现场质检（Field Validation）数据 =====
     # ROW_REMAPPER（显存行重映射——RMA判定核心）
@@ -1192,6 +1250,32 @@ summary{{cursor:pointer;color:#1565c0;font-weight:bold;padding:4px;}}
 <details class="raw-section">
 <summary>DCGM 详细统计 (PCIe/Xid/ECC实时计数)</summary>
 <pre>{data.get('dcgm_stats','')}</pre>
+</details>
+
+<h2>八.5、NVIDIA fieldiag 原厂现场诊断（Field Diagnostics）</h2>
+<p class="small">fieldiag 是 NVIDIA 原厂现场工程师专用诊断工具，比 dcgmi diag 更深入，覆盖存储/计算/PCIe/NVLink 全子系统。通过企业合作伙伴渠道获取。</p>
+{
+    (lambda fi: (
+        f'<table class="info-table"><tr>'
+        f'<th>状态</th><th>诊断级别</th><th>结果</th><th>耗时</th></tr>'
+        f'<tr><td>{"<span style=.color:#2e7d32;font-weight:bold.>已安装</span>" if fi.get("installed") else "<span style=.color:#e65100;font-weight:bold.>未安装</span>"}</td>'
+        f'<td>{fi.get("level","—")}</td>'
+        f'<td>{("PASS" if fi.get("passed") else "FAIL") if fi.get("installed") else "N/A"}</td>'
+        f'<td>{fi.get("duration","—")}</td></tr></table>'
+    ))(data.get("fieldiag", {}))
+}
+{
+    (lambda fi: (
+        f'<p style="color:#c62828;">fieldiag 诊断未通过，请查看原始输出。这是NVIDIA原厂诊断工具，未通过意味着需要RMA或联系原厂支持。</p>'
+        if fi.get("installed") and not fi.get("passed") else
+        f'<p style="color:#e65100;">fieldiag 未安装。获取方式：<br>1. NVIDIA企业合作伙伴门户: https://partner.nvidia.com<br>2. NVIDIA开发者门户: https://developer.nvidia.com<br>3. 联系NVIDIA技术支持<br>获取后放置到 /usr/local/cuda/bin/fieldiag 或 /opt/nvidia/fieldiag 重新运行脚本</p>'
+        if not fi.get("installed") else
+        ''
+    ))(data.get("fieldiag", {}))
+}
+<details class="raw-section">
+<summary>fieldiag 原始诊断输出</summary>
+<pre>{data.get("fieldiag", {}).get("raw", "")}</pre>
 </details>
 
 <h2>九、NVIDIA 原厂现场质检（Field Validation）</h2>
