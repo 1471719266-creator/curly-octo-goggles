@@ -65,6 +65,8 @@ install_system_deps() {
     command -v make    &>/dev/null || deps_missing+=("make")
     command -v gcc     &>/dev/null || deps_missing+=("gcc")
     command -v unzip   &>/dev/null || deps_missing+=("unzip")
+    command -v file    &>/dev/null || deps_missing+=("file")
+    command -v ldd     &>/dev/null || deps_missing+=("libc-bin")
 
     if [ ${#deps_missing[@]} -gt 0 ]; then
         log_info "缺少依赖: ${deps_missing[*]}，正在安装..."
@@ -915,6 +917,136 @@ test_fieldiag() {
     fi
 
     log_ok "找到 fieldiag: ${fieldiag_bin}"
+
+    # ================================================================
+    # fieldiag 二进制兼容性自检（从20.04拷到24.04的常见问题）
+    #   检查项:
+    #     1. ELF架构是否匹配（x86_64 vs aarch64）
+    #     2. 可执行权限
+    #     3. 共享库依赖（ldd 全 resolvable，缺 libcuda.so.1/DCGM 库最常见）
+    #     4. --version 能否正常返回（glibc/ABI 兼容性）
+    #     5. GPU架构支持（Hopper/Blackwell/H200/B300需要较新的fieldiag）
+    # ================================================================
+    log_info "fieldiag 兼容性自检（跨系统拷贝后必跑）..."
+    local compat_ok=true
+
+    # [1] ELF架构检查
+    local elf_arch=""
+    elf_arch=$(file -b "${fieldiag_bin}" 2>/dev/null | head -n1)
+    local host_arch=""
+    host_arch=$(uname -m)
+    log_info "  [1/5] ELF架构: ${elf_arch} (主机: ${host_arch})"
+    if echo "${elf_arch}" | grep -qi "${host_arch}"; then
+        log_ok "    架构匹配"
+    else
+        log_error "    ❌ 架构不匹配！fieldiag 是 ${elf_arch}，主机是 ${host_arch}"
+        compat_ok=false
+    fi
+
+    # [2] 可执行权限（某些文件系统拷贝后权限丢失）
+    log_info "  [2/5] 可执行权限..."
+    if [ -x "${fieldiag_bin}" ]; then
+        log_ok "    ✓ 已有执行权限"
+    else
+        log_warn "    ✗ 无执行权限，自动 chmod +x..."
+        chmod +x "${fieldiag_bin}" 2>/dev/null || {
+            log_error "    ❌ chmod +x 失败（权限不足或文件系统为noexec挂载）"
+            compat_ok=false
+        }
+    fi
+
+    # [3] 共享库依赖检查（ldd）
+    log_info "  [3/5] 共享库依赖检查..."
+    local ldd_out=""
+    ldd_out=$(ldd "${fieldiag_bin}" 2>&1)
+    local missing_libs=""
+    missing_libs=$(echo "${ldd_out}" | grep -i "not found\|无法找到\|未找到" 2>/dev/null || true)
+    if [ -z "${missing_libs}" ]; then
+        log_ok "    ✓ 所有依赖库已解析"
+    else
+        log_error "    ❌ 缺少以下依赖库（从20.04拷到24.04常见情况）:"
+        while IFS= read -r line; do
+            log_error "        ${line}"
+        done <<< "${missing_libs}"
+        # 常见缺库修复指引
+        if echo "${missing_libs}" | grep -qi "libcuda"; then
+            log_warn "      缺 libcuda.so.1 → NVIDIA 驱动未安装或未加载，先跑脚本安装驱动后再试"
+        fi
+        if echo "${missing_libs}" | grep -qi "dcgm\|nvidia-ml"; then
+            log_warn "      缺 DCGM/nvidia-ml → 脚本的 install_dcgm() 会安装，或手动 apt install datacenter-gpu-manager"
+        fi
+        if echo "${missing_libs}" | grep -qi "libc\.so"; then
+            log_warn "      缺 glibc 特定版本 → 20.04是glibc 2.31，24.04是glibc 2.39"
+            log_warn "        解决方式: 从 24.04 配套的 CUDA Toolkit/Driver 重新获取 fieldiag 版本"
+        fi
+        compat_ok=false
+    fi
+    # 保存 ldd 供报告查看
+    echo "${ldd_out}" > "${RAW_DATA_DIR}/fieldiag_ldd.txt"
+
+    # [4] --version / --help 能否正常返回（glibc ABI 兼容性最终验证）
+    log_info "  [4/5] glibc ABI 兼容性验证（运行 fieldiag --version）..."
+    local ver_out=""
+    local ver_ret=0
+    ver_out=$("${fieldiag_bin}" --version 2>&1) || ver_ret=$?
+    if [ ${ver_ret} -eq 0 ] || [ ${ver_ret} -eq 1 ]; then
+        # 某些版本 --version 正常返回 0，有些 --version 不支持返回 1（但至少有输出）
+        log_ok "    ✓ fieldiag --version 可运行 (输出: $(echo "${ver_out}" | head -n1))"
+        echo "${ver_out}" > "${RAW_DATA_DIR}/fieldiag_version.txt"
+    else
+        log_error "    ❌ fieldiag --version 运行失败 (返回码=${ver_ret})"
+        log_error "        输出: $(echo "${ver_out}" | head -n5)"
+        # 典型错误：/lib64/ld-linux-x86-64.so.2: bad ELF interpreter / segmentation fault
+        if echo "${ver_out}" | grep -qi "bad ELF interpreter\|No such file or directory"; then
+            log_error "      原因: glibc 加载器路径差异（20.04 vs 24.04 loader路径不同）"
+            log_error "      解决: 从24.04配套的CUDA包中重新获取fieldiag，或安装compat-glibc"
+        fi
+        if echo "${ver_out}" | grep -qi "segmentation fault\|段错误"; then
+            log_error "      原因: 段错误，ABI不兼容或依赖库版本不匹配"
+            log_error "      解决: 使用与当前24.04驱动/CUDA版本匹配的fieldiag"
+        fi
+        compat_ok=false
+    fi
+
+    # [5] H200/B300 架构支持检查（fieldiag版本过老不支持Hopper/Blackwell）
+    log_info "  [5/5] GPU 架构支持检查..."
+    if command -v nvidia-smi &>/dev/null; then
+        local gpu_names=""
+        gpu_names=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || true)
+        log_info "    当前服务器GPU: ${gpu_names}"
+        # 检查H200/H100/B300等较新的架构是否存在
+        if echo "${gpu_names}" | grep -qiE "H200|H100|B300|B200|Blackwell|Hopper"; then
+            log_warn "    检测到 Hopper/Blackwell 架构（H200/H100/B200/B300）"
+            log_warn "    如果是较旧的 fieldiag（2023年前版本）可能不支持上述GPU诊断"
+            log_warn "    如果兼容性自检全通过但实际诊断报 GPU Unsupported，需升级 fieldiag 版本"
+        fi
+    else
+        log_warn "    nvidia-smi 未安装，无法检测GPU架构（请先安装NVIDIA驱动）"
+    fi
+
+    # 最终判定
+    echo "${RAW_DATA_DIR}/fieldiag_version.txt"  # keep newline
+    if [ "${compat_ok}" = "true" ]; then
+        log_ok "fieldiag 兼容性自检 ✓ 全部通过，可以直接运行"
+    else
+        log_error "fieldiag 兼容性自检 ❌ 未通过"
+        log_error "处理方式（按优先级）："
+        log_error "  1. 【推荐】从与 Ubuntu 24.04 配套的 CUDA ${CUDA_VERSION} Toolkit 重新获取 fieldiag（版本匹配）"
+        log_error "  2. 安装缺失的依赖库：apt install libnvidia-ml-dev datacenter-gpu-manager"
+        log_error "  3. glibc 不兼容 → 只能用与目标系统匹配的 fieldiag 版本（静态编译版无此问题）"
+        log_error "  4. 在原20.04服务器上运行 ldd fieldiag 查看完整依赖列表"
+        # 仍然写入结果
+        echo "INCOMPATIBLE" > "${RAW_DATA_DIR}/fieldiag_result.txt"
+        {
+            echo "fieldiag 二进制兼容性自检失败"
+            echo "架构: ${elf_arch} (主机: ${host_arch})"
+            echo "缺失库:"
+            echo "${missing_libs:-无}"
+            echo "版本测试输出:"
+            echo "${ver_out:-无}"
+        } > "${RAW_DATA_DIR}/fieldiag_diag.txt"
+        return
+    fi
 
     # 根据 FIELD_LEVEL 确定参数和超时
     local fieldiag_args=""

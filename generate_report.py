@@ -413,6 +413,9 @@ def parse_fieldiag(result_path: Path, diag_path: Path, level_path: Path) -> Dict
     elif result_text == "TIMEOUT":
         result["passed"] = False
         result["errors"].append("fieldiag 诊断超时")
+    elif result_text == "INCOMPATIBLE":
+        result["passed"] = True  # 兼容性失败不算诊断失败，不影响整体判定
+        result["incompatible"] = True
     elif result_text == "NOT_INSTALLED":
         result["passed"] = True  # 未安装不算失败，不影响整体判定
         result["installed"] = False
@@ -1258,17 +1261,26 @@ summary{{cursor:pointer;color:#1565c0;font-weight:bold;padding:4px;}}
     (lambda fi: (
         f'<table class="info-table"><tr>'
         f'<th>状态</th><th>诊断级别</th><th>结果</th><th>耗时</th></tr>'
-        f'<tr><td>{"<span style=.color:#2e7d32;font-weight:bold.>已安装</span>" if fi.get("installed") else "<span style=.color:#e65100;font-weight:bold.>未安装</span>"}</td>'
+        f'<tr><td>{"<span style=.color:#c62828;font-weight:bold.>不兼容</span>" if fi.get("incompatible") else ("<span style=.color:#2e7d32;font-weight:bold.>已安装</span>" if fi.get("installed") else "<span style=.color:#e65100;font-weight:bold.>未安装</span>")}</td>'
         f'<td>{fi.get("level","—")}</td>'
-        f'<td>{("PASS" if fi.get("passed") else "FAIL") if fi.get("installed") else "N/A"}</td>'
+        f'<td>{"INCOMPATIBLE" if fi.get("incompatible") else (("PASS" if fi.get("passed") else "FAIL") if fi.get("installed") else "N/A")}</td>'
         f'<td>{fi.get("duration","—")}</td></tr></table>'
     ))(data.get("fieldiag", {}))
 }
 {
     (lambda fi: (
         f'<p style="color:#c62828;">fieldiag 诊断未通过，请查看原始输出。这是NVIDIA原厂诊断工具，未通过意味着需要RMA或联系原厂支持。</p>'
-        if fi.get("installed") and not fi.get("passed") else
-        f'<p style="color:#e65100;">fieldiag 未安装。获取方式：<br>1. NVIDIA企业合作伙伴门户: https://partner.nvidia.com<br>2. NVIDIA开发者门户: https://developer.nvidia.com<br>3. 联系NVIDIA技术支持<br>获取后放置到 /usr/local/cuda/bin/fieldiag 或 /opt/nvidia/fieldiag 重新运行脚本</p>'
+        if fi.get("installed") and not fi.get("incompatible") and not fi.get("passed") else
+        f'<p style="color:#e65100;"><strong>fieldiag 二进制兼容性自检失败（从20.04拷贝到24.04的典型问题）：</strong><br>'
+        '解决方式（按优先级）：<br>'
+        '1. <b>【推荐】</b>从与当前 Ubuntu 24.04 配套的 CUDA Toolkit 中重新获取 fieldiag 版本（glibc 2.39 版本）<br>'
+        '2. 安装缺失依赖：apt install libnvidia-ml-dev datacenter-gpu-manager<br>'
+        '3. 在原20.04服务器上运行 <code>ldd ./fieldiag</code> 查看完整依赖列表，逐个在24.04上确认版本<br>'
+        '4. glibc 版本差异严重不兼容 → 必须使用 24.04 配套的 fieldiag 版本（或静态编译版）<br>'
+        '原始自检输出：<br><pre style="background:#fff3e0;padding:8px;font-size:11px;">'
+        + fi.get("raw","")[:3000] + "</pre></p>"
+        if fi.get("incompatible") else
+        f'<p style="color:#e65100;">fieldiag 未安装。获取方式：<br>1. NVIDIA企业合作伙伴门户: https://partner.nvidia.com<br>2. NVIDIA开发者门户: https://developer.nvidia.com<br>3. 联系NVIDIA技术支持<br>获取后放置到 /usr/local/cuda/bin/fieldiag 或 /opt/nvidia/fieldiag 重新运行脚本。<br><b>注意：从Ubuntu 20.04拷贝过来的二进制文件，脚本会自动跑5项兼容性自检，不兼容会给出具体修复指引。</b></p>'
         if not fi.get("installed") else
         ''
     ))(data.get("fieldiag", {}))
@@ -1276,6 +1288,14 @@ summary{{cursor:pointer;color:#1565c0;font-weight:bold;padding:4px;}}
 <details class="raw-section">
 <summary>fieldiag 原始诊断输出</summary>
 <pre>{data.get("fieldiag", {}).get("raw", "")}</pre>
+</details>
+<details class="raw-section">
+<summary>fieldiag 兼容性自检：ldd 共享库依赖列表</summary>
+<pre>{safe_read(raw_dir_global / 'fieldiag_ldd.txt', 300) if raw_dir_global else ''}</pre>
+</details>
+<details class="raw-section">
+<summary>fieldiag 兼容性自检：--version 输出</summary>
+<pre>{safe_read(raw_dir_global / 'fieldiag_version.txt', 100) if raw_dir_global else ''}</pre>
 </details>
 
 <h2>九、NVIDIA 原厂现场质检（Field Validation）</h2>
