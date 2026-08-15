@@ -64,91 +64,130 @@ init() {
 interactive_menu() {
     # 如果不是TTY（比如ssh管道调用），直接使用默认值不交互
     if [ ! -t 0 ]; then
-        echo "[交互菜单] 非终端环境，使用默认值: fieldiag=Level${FIELD_LEVEL}, 压力=${STRESS_DURATION_SEC}s, 温度报警=${TEMP_ALARM_C}℃"
+        echo "[交互菜单] 非终端环境，使用默认值: 压力=${STRESS_DURATION_SEC}s gpu-burn=${GPUBURN_DURATION_SEC}s 温度报警=${TEMP_ALARM_C}℃"
         return 0
     fi
 
+    # ================================================================
+    # 进入菜单前先判断：fieldiag 菜单有没有必要显示
+    #   只有满足 (A) fieldiag二进制存在  且  (B) 至少1块数据中心GPU → 才显示Level选择
+    #   否则直接一句话提示并跳过，不浪费用户时间
+    # ================================================================
+    local show_field_level=false
+    local field_skip_reason=""
+
+    local f_bin=""
+    for p in /usr/local/cuda/bin/fieldiag /usr/local/cuda/bin/nvidia-fieldiag \
+        /opt/nvidia/fieldiag /opt/nvidia/fieldiag/bin/fieldiag \
+        /usr/bin/fieldiag /usr/bin/nvidia-fieldiag \
+        "${SCRIPT_DIR}/fieldiag" "${SCRIPT_DIR}/tools/fieldiag"; do
+        [ -x "${p}" ] && f_bin="${p}" && break
+    done
+    [ -z "${f_bin}" ] && f_bin=$(command -v fieldiag 2>/dev/null || command -v nvidia-fieldiag 2>/dev/null || true)
+
+    local gpu_names=""
+    command -v nvidia-smi &>/dev/null && gpu_names=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || true)
+    local has_datacenter=false
+    if [ -n "${gpu_names}" ]; then
+        while IFS= read -r gn; do
+            [ -z "${gn}" ] && continue
+            if echo "${gn}" | grep -qiE "(H100|H200|H800|H900|B200|B300|B380|B390|GB200|GB300|A100|A800|A900|A30|A10|A10G|T4|T4g|L4|L40|L40S|V100|V100S|P100|P40|P4|K80|K40|M60|M40|A2|L20|L2|L10|L10G|PG500|PG506|PG509|HGX|DGX|Tesla|GRID|Quadro (RTX|GV100|GP100))"; then
+                has_datacenter=true; break
+            fi
+        done <<< "${gpu_names}"
+    fi
+
+    if [ -n "${f_bin}" ] && [ "${has_datacenter}" = "true" ]; then
+        show_field_level=true
+    else
+        if [ -z "${f_bin}" ]; then
+            field_skip_reason="ℹ️  未找到 fieldiag 二进制，本次自动跳过原厂现场诊断（PCIe/温度等检测仍会完整执行）"
+        elif [ "${has_datacenter}" = "false" ]; then
+            field_skip_reason="ℹ️  检测到消费级/非数据中心GPU，本次自动跳过fieldiag原厂诊断（PCIe/温度等检测仍会完整执行）"
+        fi
+    fi
+
     local sel=""
+    local step=0
     echo ""
     echo "╔══════════════════════════════════════════════════════════════╗"
     echo "║    NVIDIA GPU 售后服务自动化测试 · 启动配置                 ║"
-    echo "║    直接回车 = 采用默认值                                     ║"
+    echo "║    直接回车 = 采用默认值，全部保留默认可一路回车到底         ║"
     echo "╚══════════════════════════════════════════════════════════════╝"
 
-    # ---- Step 1: fieldiag 等级 ----
-    echo ""
-    echo "【1/4】NVIDIA fieldiag 原厂现场诊断级别（只有装了fieldiag二进制才生效）："
-    echo "    1) Level 1 快速测试  (~5~15 分钟)  ← 日常验收"
-    echo "    2) Level 2 中等深度  (~4 小时)     ← 默认，推荐售后RMA前"
-    echo "    3) Level 3 完整诊断  (~6 小时)     ← 出厂质检/重大故障深挖"
-    read -rp "    请选择 [默认 2]: " sel
-    case "${sel}" in
-        1) FIELD_LEVEL=1 ;;
-        3) FIELD_LEVEL=3 ;;
-        2|"") FIELD_LEVEL=2 ;;
-        *) echo "    无效选择，保留默认 Level 2"; FIELD_LEVEL=2 ;;
-    esac
+    # ===== 条件显示：fieldiag等级 =====
+    if [ "${show_field_level}" = "true" ]; then
+        step=$((step + 1))
+        echo ""
+        echo "【${step}/4】NVIDIA fieldiag 原厂现场诊断级别："
+        echo "    1) Level 1 快速测试  (~5~15 分钟)  ← 日常验收"
+        echo "    2) Level 2 中等深度  (~4 小时)     ← 默认，推荐售后RMA前"
+        echo "    3) Level 3 完整诊断  (~6 小时)     ← 出厂质检/重大故障深挖"
+        read -rp "    请选择 [默认 2]: " sel
+        case "${sel}" in
+            1) FIELD_LEVEL=1 ;;
+            3) FIELD_LEVEL=3 ;;
+            2|"") FIELD_LEVEL=2 ;;
+            *) echo "    无效选择，保留默认 Level 2"; FIELD_LEVEL=2 ;;
+        esac
+    else
+        echo ""
+        echo "${field_skip_reason}"
+    fi
 
-    # ---- Step 2: nbody 压力测试时长 ----
+    # ===== nbody 压力时长 =====
+    step=$((step + 1))
     echo ""
-    echo "【2/5】① nbody满载压力时长（第10步：算力+温度压力）："
-    echo "    售后服务建议 60~300 秒；例：60 / 120 / 300 / 600"
-    read -rp "    请输入秒数 [默认 ${STRESS_DURATION_SEC}]: " sel
+    echo "【${step}/4】① nbody满载压力时长（第10步：算力+温度压力，所有GPU同时跑）："
+    echo "    推荐：60~300 秒；例：60 / 120 / 300 / 600"
+    read -rp "    秒数 [默认 ${STRESS_DURATION_SEC}]: " sel
     if [ -n "${sel}" ] && [[ "${sel}" =~ ^[0-9]+$ ]] && [ "${sel}" -gt 0 ]; then
         STRESS_DURATION_SEC="${sel}"
     else
         [ -n "${sel}" ] && echo "    无效值，保留默认 ${STRESS_DURATION_SEC} 秒"
     fi
 
-    # ---- Step 2.5: gpu-burn 烧机时长 ----
+    # ===== gpu-burn 烧机时长 =====
+    step=$((step + 1))
     echo ""
-    echo "【3/5】② gpu-burn 烧机时长（第13.5步：矩阵乘法正确性+满载烧机，单块GPU耗时）："
-    echo "    售后服务建议 120~300 秒；8卡服务器 x ${GPUBURN_DURATION_SEC}秒 = 总时长"
-    read -rp "    请输入秒数 [默认 ${GPUBURN_DURATION_SEC}]: " sel
+    echo "【${step}/4】② gpu-burn 烧机时长（第13.5步：矩阵乘法正确性 + 满载烧机，逐块GPU单独跑）："
+    echo "    推荐：120~300 秒；总时长 = GPU数量 × 该值"
+    read -rp "    秒数 [默认 ${GPUBURN_DURATION_SEC}]: " sel
     if [ -n "${sel}" ] && [[ "${sel}" =~ ^[0-9]+$ ]] && [ "${sel}" -gt 0 ]; then
         GPUBURN_DURATION_SEC="${sel}"
     else
         [ -n "${sel}" ] && echo "    无效值，保留默认 ${GPUBURN_DURATION_SEC} 秒"
     fi
 
-    # ---- Step 3: 温度报警阈值 ----
+    # ===== 温度报警阈值 =====
+    step=$((step + 1))
     echo ""
-    echo "【4/5】温度报警阈值（最高温度，超过自动暂停测试；H100/H200/B300建议92，A100建议90，消费级建议85）："
-    echo "    例：80 / 85 / 90 / 92 / 95"
-    read -rp "    请输入摄氏度 [默认 ${TEMP_ALARM_C}]: " sel
+    echo "【${step}/4】温度报警阈值（超温自动暂停；H100/B300建议92，A100建议90，消费级建议85）："
+    read -rp "    摄氏度 [默认 ${TEMP_ALARM_C}]: " sel
     if [ -n "${sel}" ] && [[ "${sel}" =~ ^[0-9]+$ ]] && [ "${sel}" -ge 50 ] && [ "${sel}" -le 110 ]; then
         TEMP_ALARM_C="${sel}"
     else
-        [ -n "${sel}" ] && echo "    无效值（应在 50~110 之间），保留默认 ${TEMP_ALARM_C}℃"
+        [ -n "${sel}" ] && echo "    无效值（50~110之间），保留默认 ${TEMP_ALARM_C}℃"
     fi
 
-    # ---- Step 4: 冷却恢复温度（必须低于报警阈值） ----
+    # 冷却恢复温度：用报警-15的默认值即可，菜单里少输一步
     local default_cool=$(( TEMP_ALARM_C - 15 ))
     [ "${default_cool}" -lt 40 ] && default_cool=40
-    echo ""
-    echo "【5/5】冷却恢复温度（降到该温度以下自动恢复测试，建议比报警阈值低 10~20℃）："
-    read -rp "    请输入摄氏度 [默认 ${default_cool}]: " sel
-    if [ -n "${sel}" ] && [[ "${sel}" =~ ^[0-9]+$ ]]; then
-        if [ "${sel}" -lt "${TEMP_ALARM_C}" ]; then
-            TEMP_COOLDOWN_C="${sel}"
-        else
-            echo "    恢复温度必须低于报警温度(${TEMP_ALARM_C}℃)，使用默认 ${default_cool}℃"
-            TEMP_COOLDOWN_C="${default_cool}"
-        fi
-    else
-        TEMP_COOLDOWN_C="${default_cool}"
-    fi
+    TEMP_COOLDOWN_C="${default_cool}"
 
     echo ""
     echo "╔══════════════════════════════════════════════════════════════╗"
     echo "║  最终配置确认："
-    echo "║   · fieldiag 诊断等级 : Level ${FIELD_LEVEL}"
-    echo "║   · ① nbody压力时长  : ${STRESS_DURATION_SEC} 秒"
-    echo "║   · ② gpu-burn时长   : ${GPUBURN_DURATION_SEC} 秒 / 每块GPU"
-    echo "║   · 温度报警阈值     : ${TEMP_ALARM_C} ℃（超过自动暂停）"
-    echo "║   · 冷却恢复温度     : ${TEMP_COOLDOWN_C} ℃（低于后自动继续）"
-    echo "║  运行中手动暂停      : touch \${OUTPUT_DIR}/.manual_pause"
-    echo "║  运行中手动恢复      : rm    -f \${OUTPUT_DIR}/.manual_pause"
+    if [ "${show_field_level}" = "true" ]; then
+        echo "║   · fieldiag 诊断等级 : Level ${FIELD_LEVEL}   (二进制: ${f_bin})"
+    else
+        echo "║   · fieldiag         : ${field_skip_reason}"
+    fi
+    echo "║   · ① nbody 压力时长 : ${STRESS_DURATION_SEC} 秒（全GPU并行）"
+    echo "║   · ② gpu-burn 时长  : ${GPUBURN_DURATION_SEC} 秒 / 每块GPU"
+    echo "║   · 温度报警 / 恢复  : ≥ ${TEMP_ALARM_C}℃ 暂停 → ≤ ${TEMP_COOLDOWN_C}℃ 自动继续"
+    echo "║   · 运行中手动暂停   : touch \${OUTPUT_DIR}/.manual_pause"
+    echo "║   · 运行中手动恢复   : rm    -f \${OUTPUT_DIR}/.manual_pause"
     echo "╚══════════════════════════════════════════════════════════════╝"
     echo ""
 }
@@ -1109,20 +1148,13 @@ test_fieldiag() {
     fi
 
     if [ -z "${fieldiag_bin}" ]; then
-        echo ""
-        log_warn "fieldiag 未安装，跳过原厂现场诊断"
-        log_warn "fieldiag 是 NVIDIA 原厂现场工程师专用诊断工具，比 dcgmi diag 更深入"
-        log_warn "获取方式（按优先级）："
-        log_warn "  1. NVIDIA 企业合作伙伴门户: https://partner.nvidia.com → 下载中心 → 诊断工具"
-        log_warn "  2. NVIDIA 开发者门户: https://developer.nvidia.com → 数据中心GPU管理工具"
-        log_warn "  3. 联系 NVIDIA 技术支持（需提供GPU序列号和保修信息）"
-        log_warn "获取后放置到以下任一路径，重新运行脚本即可自动识别："
-        log_warn "  /usr/local/cuda/bin/fieldiag"
-        log_warn "  /opt/nvidia/fieldiag"
-        log_warn "  ${SCRIPT_DIR}/fieldiag（与本脚本同目录）"
-        # 写入结果标记，报告生成器会识别
+        log_info "fieldiag 二进制未找到，直接跳过原厂现场诊断（不影响其他测试）"
+        # 写入结果标记，报告生成器会识别（不显示冗长下载提示，避免用户困惑）
         echo "NOT_INSTALLED" > "${RAW_DATA_DIR}/fieldiag_result.txt"
-        echo "fieldiag 未安装，Level ${FIELD_LEVEL} 诊断跳过" > "${RAW_DATA_DIR}/fieldiag_diag.txt"
+        {
+            echo "fieldiag 二进制未找到，Level ${FIELD_LEVEL} 诊断已自动跳过"
+            echo "说明：PCIe/温度/ECC/显存/带宽/DCGM/dcgmi diag 等其余测试仍完整执行，售后检测结论仍然权威可靠"
+        } > "${RAW_DATA_DIR}/fieldiag_diag.txt"
         return
     fi
 
