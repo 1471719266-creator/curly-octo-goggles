@@ -50,6 +50,42 @@ save_raw() {
 }
 
 # =========================================
+# 0. 安装系统级依赖（wget/curl/git/lspci/python3 等基础工具）
+# =========================================
+install_system_deps() {
+    log_info "========== 0. 安装系统级依赖工具 =========="
+
+    local deps_missing=()
+    command -v wget    &>/dev/null || deps_missing+=("wget")
+    command -v curl    &>/dev/null || deps_missing+=("curl")
+    command -v git     &>/dev/null || deps_missing+=("git")
+    command -v lspci   &>/dev/null || deps_missing+=("pciutils")
+    command -v python3 &>/dev/null || deps_missing+=("python3")
+    command -v make    &>/dev/null || deps_missing+=("make")
+    command -v gcc     &>/dev/null || deps_missing+=("gcc")
+
+    if [ ${#deps_missing[@]} -gt 0 ]; then
+        log_info "缺少依赖: ${deps_missing[*]}，正在安装..."
+        sudo apt-get update -y >> "${LOG_FILE}" 2>&1
+        sudo apt-get install -y "${deps_missing[@]}" >> "${LOG_FILE}" 2>&1
+        if [ $? -eq 0 ]; then
+            log_ok "系统依赖安装完成: ${deps_missing[*]}"
+        else
+            log_error "系统依赖安装失败，请手动执行: sudo apt-get install ${deps_missing[*]}"
+            exit 1
+        fi
+    else
+        log_ok "系统依赖工具已就绪（wget/curl/git/lspci/python3/make/gcc）"
+    fi
+
+    # 确保 build-essential 完整（编译 cuda-samples 需要）
+    if ! dpkg -s build-essential &>/dev/null; then
+        log_info "安装 build-essential（编译环境）..."
+        sudo apt-get install -y build-essential >> "${LOG_FILE}" 2>&1
+    fi
+}
+
+# =========================================
 # 1. 系统环境检测
 # =========================================
 check_system() {
@@ -744,6 +780,7 @@ EOF
     log_info "输出目录: ${OUTPUT_DIR}"
 
     if [ "${stress_only}" = "true" ]; then
+        install_system_deps
         check_system
         check_nvidia_driver
         enumerate_gpus
@@ -754,11 +791,13 @@ EOF
     fi
 
     if [ "${skip_install}" = "false" ]; then
+        install_system_deps
         check_system
         check_nvidia_driver
         install_cuda_toolkit
         install_dcgm
     else
+        install_system_deps
         check_system
         check_nvidia_driver
         # 检查CUDA可用性
