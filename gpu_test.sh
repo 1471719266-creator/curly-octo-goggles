@@ -300,13 +300,17 @@ install_dcgm() {
 }
 
 # =========================================
-# 4.5 下载编译原厂质检工具：gpu-burn + cuda_memtest
-#   - gpu-burn: 满载烧机+正确性校验（矩阵乘法结果与CPU基准比对）
-#   - cuda_memtest: 显存10种模式主动写入-读出-校验（行业级显存质检标准）
+# 4.5 下载编译质检工具
+#   原厂工具（随CUDA Toolkit自带，无需下载）：
+#     - cuda-memcheck: NVIDIA原厂CUDA内存错误检测器（随CUDA Toolkit安装）
+#     - nvbandwidth:  NVIDIA原厂新一代PCIe/NVLink带宽测试工具（较新CUDA版本自带）
+#   第三方补充工具（需下载编译）：
+#     - gpu-burn: 满载烧机+正确性校验（矩阵乘法结果与CPU基准比对）
+#     - cuda_memtest: 显存10种模式主动写入-读出-校验（行业级显存质检标准）
 #   下载策略：git clone → wget zip → curl zip → ghproxy镜像（4层回退）
 # =========================================
 install_factory_tools() {
-    log_info "========== 4.5 下载编译原厂质检工具（gpu-burn + cuda_memtest） =========="
+    log_info "========== 4.5 质检工具准备 =========="
 
     local FACTORY_BIN="${OUTPUT_DIR}/factory_tools_bin"
     mkdir -p "${FACTORY_BIN}"
@@ -514,17 +518,77 @@ install_factory_tools() {
         fi
     fi
 
-    # 最终检查
-    log_info "原厂质检工具就绪状态:"
-    if [ -x "${FACTORY_BIN}/gpu_burn" ]; then
-        log_ok "  gpu_burn: ✓ 可用"
+    # ================================================================
+    # 原厂工具检测（随CUDA Toolkit自带，无需下载）
+    # ================================================================
+
+    # cuda-memcheck: NVIDIA原厂CUDA内存错误检测器
+    log_info "检测 NVIDIA 原厂工具..."
+    local CMC_BIN=""
+    # cuda-memcheck 通常在 /usr/local/cuda/bin/ 或 /usr/local/cuda/computeprof/bin/
+    for p in /usr/local/cuda/bin/cuda-memcheck /usr/local/cuda/extras/CUPTI/bin/cuda-memcheck \
+             /usr/local/cuda/computeprof/bin/cuda-memcheck; do
+        if [ -x "${p}" ]; then CMC_BIN="${p}"; break; fi
+    done
+    # 也检查PATH
+    if [ -z "${CMC_BIN}" ]; then
+        CMC_BIN=$(command -v cuda-memcheck 2>/dev/null || true)
+    fi
+    if [ -n "${CMC_BIN}" ]; then
+        cp "${CMC_BIN}" "${FACTORY_BIN}/cuda-memcheck" 2>/dev/null || true
+        log_ok "  [原厂] cuda-memcheck: ✓ 可用 (${CMC_BIN})"
     else
-        log_warn "  gpu_burn: ✗ 不可用（满载烧机正确性校验将跳过）"
+        log_warn "  [原厂] cuda-memcheck: ✗ 未找到（应随CUDA Toolkit安装，请检查 /usr/local/cuda/bin/）"
+    fi
+
+    # nvbandwidth: NVIDIA原厂新一代带宽测试工具（CUDA 12.6+自带）
+    local NVBW_BIN=""
+    for p in /usr/local/cuda/bin/nvbandwidth /usr/local/cuda/nvbandwidth; do
+        if [ -x "${p}" ]; then NVBW_BIN="${p}"; break; fi
+    done
+    if [ -z "${NVBW_BIN}" ]; then
+        NVBW_BIN=$(command -v nvbandwidth 2>/dev/null || true)
+    fi
+    # nvbandwidth 可能需要从CUDA samples编译
+    if [ -z "${NVBW_BIN}" ]; then
+        local NVBW_SRC="/usr/local/cuda/nvbandwidth"
+        [ -d "/tmp/cuda-samples/Samples/nvbandwidth" ] && NVBW_SRC="/tmp/cuda-samples/Samples/nvbandwidth"
+        if [ -d "${NVBW_SRC}" ] && [ -f "${NVBW_SRC}/Makefile" ]; then
+            log_info "  编译 nvbandwidth (原厂)..."
+            make -C "${NVBW_SRC}" >> "${LOG_FILE}" 2>&1 || true
+            NVBW_BIN=$(find "${NVBW_SRC}" -name "nvbandwidth" -type f -executable 2>/dev/null | head -n1)
+        fi
+    fi
+    if [ -n "${NVBW_BIN}" ]; then
+        cp "${NVBW_BIN}" "${FACTORY_BIN}/nvbandwidth" 2>/dev/null || true
+        log_ok "  [原厂] nvbandwidth: ✓ 可用 (${NVBW_BIN})"
+    else
+        log_warn "  [原厂] nvbandwidth: ✗ 未找到（较老CUDA版本可能不含，使用bandwidthTest替代）"
+    fi
+
+    # 最终检查
+    log_info "===== 质检工具就绪状态汇总 ====="
+    log_info "--- NVIDIA 原厂工具 ---"
+    if [ -x "${FACTORY_BIN}/cuda-memcheck" ]; then
+        log_ok "  [原厂] cuda-memcheck: ✓ 可用"
+    else
+        log_warn "  [原厂] cuda-memcheck: ✗ 未找到"
+    fi
+    if [ -x "${FACTORY_BIN}/nvbandwidth" ]; then
+        log_ok "  [原厂] nvbandwidth: ✓ 可用"
+    else
+        log_warn "  [原厂] nvbandwidth: ✗ 未找到（用bandwidthTest替代）"
+    fi
+    log_info "--- 第三方补充工具 ---"
+    if [ -x "${FACTORY_BIN}/gpu_burn" ]; then
+        log_ok "  [第三方] gpu_burn: ✓ 可用"
+    else
+        log_warn "  [第三方] gpu_burn: ✗ 不可用（满载烧机正确性校验将跳过）"
     fi
     if [ -x "${FACTORY_BIN}/cuda_memtest" ]; then
-        log_ok "  cuda_memtest: ✓ 可用"
+        log_ok "  [第三方] cuda_memtest: ✓ 可用"
     else
-        log_warn "  cuda_memtest: ✗ 不可用（显存10种模式校验将回退到bandwidthTest）"
+        log_warn "  [第三方] cuda_memtest: ✗ 不可用（显存校验将回退到bandwidthTest）"
     fi
 }
 
@@ -579,23 +643,37 @@ test_device_query() {
 }
 
 # =========================================
-# 7. 官方测试二：bandwidthTest（PCIe 带宽 Host<->Device）
+# 7. PCIe 带宽测试
+#   优先级1 [原厂]: nvbandwidth — NVIDIA新一代带宽测试工具（CUDA 12.6+）
+#   优先级2 [原厂]: bandwidthTest — CUDA Samples经典带宽测试
 # =========================================
 test_bandwidth() {
-    log_info "========== 7. PCIe 带宽测试（官方 bandwidthTest） =========="
+    log_info "========== 7. PCIe 带宽测试 =========="
     local bin_dir
     bin_dir=$(cat "${OUTPUT_DIR}/cuda_bin_dir.txt" 2>/dev/null)
+    local factory_bin
+    factory_bin=$(cat "${OUTPUT_DIR}/factory_bin_dir.txt" 2>/dev/null)
     local gpu_count
     gpu_count=$(cat "${OUTPUT_DIR}/gpu_count.txt")
 
+    # 优先级1: 原厂 nvbandwidth（新一代）
+    if [ -x "${factory_bin}/nvbandwidth" ]; then
+        for (( i=0; i<gpu_count; i++ )); do
+            log_info "GPU ${i}: [原厂] nvbandwidth 带宽测试..."
+            CUDA_VISIBLE_DEVICES=${i} save_raw "nvbandwidth_gpu${i}" \
+                "${factory_bin}/nvbandwidth"
+        done
+        log_ok "[原厂] nvbandwidth 带宽测试完成"
+    fi
+
+    # 优先级2: 原厂 bandwidthTest（经典）
     if [ -x "${bin_dir}/bandwidthTest" ]; then
         for (( i=0; i<gpu_count; i++ )); do
-            log_info "测试 GPU ${i} 的PCIe带宽..."
+            log_info "GPU ${i}: [原厂] bandwidthTest PCIe带宽测试..."
             CUDA_VISIBLE_DEVICES=${i} save_raw "bandwidthTest_gpu${i}" \
                 "${bin_dir}/bandwidthTest" --device=${i} --memory=pinned --mode=range --csv
-            log_info "GPU ${i} 带宽测试完成"
         done
-        log_ok "PCIe带宽测试全部完成（结果包含 H2D/D2H/D2D）"
+        log_ok "[原厂] bandwidthTest 带宽测试完成（结果包含 H2D/D2H/D2D）"
     else
         log_warn "bandwidthTest 不可用，跳过PCIe带宽测试"
     fi
@@ -909,16 +987,16 @@ test_factory_validation() {
 }
 
 # =========================================
-# 13. 显存主动校验测试（cuda_memtest: 10种模式写入-读出-比对）
-#   这是行业级显存质检标准，覆盖以下测试模式：
-#   Test0: Walking 1s    Test1: Walking 0s   Test2: Random pattern
-#   Test3: Gaussian     Test4: Solid Bits   Test5: Address Fetch
-#   Test6: Block Seq     Test7: Checkerboard Test8: Shift
-#   Test9: Inversions   Test10: Memory
+# 13. 显存校验测试
+#   优先级1 [原厂]: cuda-memcheck — NVIDIA原厂CUDA内存错误检测器（随CUDA Toolkit自带）
+#     检测项：越界访问、未初始化内存读取、地址对齐错误、全局/共享内存竞争
+#   优先级2 [第三方]: cuda_memtest — 10种模式显存写入-读出-校验
+#     Test0~10: Walking 1s/0s, Random, Gaussian, Solid Bits, Address Fetch...
+#   优先级3 [原厂]: bandwidthTest shmoo — 仅测带宽（回退方案，无正确性校验）
 #   任何模式报错 = 显存硬件故障 → 需RMA
 # =========================================
 test_memory() {
-    log_info "========== 13. 显存主动校验测试（cuda_memtest 10种模式） =========="
+    log_info "========== 13. 显存校验测试 =========="
     local factory_bin
     factory_bin=$(cat "${OUTPUT_DIR}/factory_bin_dir.txt" 2>/dev/null)
     local cuda_bin
@@ -926,19 +1004,23 @@ test_memory() {
     local gpu_count
     gpu_count=$(cat "${OUTPUT_DIR}/gpu_count.txt")
 
-    local has_memtest=false
-    if [ -x "${factory_bin}/cuda_memtest" ]; then
-        has_memtest=true
-    fi
-
     for (( i=0; i<gpu_count; i++ )); do
-        if [ "${has_memtest}" = "true" ]; then
-            log_info "GPU ${i}: 运行 cuda_memtest 10种模式显存校验（可能需要数分钟）..."
+        # 优先级1: 原厂 cuda-memcheck（对官方matrixMul做内存错误检测）
+        if [ -x "${factory_bin}/cuda-memcheck" ] && [ -x "${cuda_bin}/matrixMul" ]; then
+            log_info "GPU ${i}: [原厂] cuda-memcheck + matrixMul 内存错误检测..."
+            CUDA_VISIBLE_DEVICES=${i} save_raw "cuda_memcheck_gpu${i}" \
+                "${factory_bin}/cuda-memcheck" --tool memcheck \
+                "${cuda_bin}/matrixMul" -wA=2048 -hA=2048 -wB=2048 -hB=2048
+        fi
+
+        # 优先级2: 第三方 cuda_memtest（10种模式显存校验）
+        if [ -x "${factory_bin}/cuda_memtest" ]; then
+            log_info "GPU ${i}: [第三方] cuda_memtest 10种模式显存校验（可能需要数分钟）..."
             CUDA_VISIBLE_DEVICES=${i} save_raw "cuda_memtest_gpu${i}" \
                 "${factory_bin}/cuda_memtest" --disable_gpu_lock
         elif [ -x "${cuda_bin}/bandwidthTest" ]; then
-            # 回退：bandwidthTest shmoo 模式（仅测带宽，不测正确性）
-            log_warn "GPU ${i}: cuda_memtest 不可用，回退到 bandwidthTest shmoo（仅带宽测试，无正确性校验）"
+            # 优先级3: 原厂 bandwidthTest shmoo（仅测带宽，无正确性校验）
+            log_warn "GPU ${i}: [回退] bandwidthTest shmoo（仅带宽测试，无正确性校验）"
             CUDA_VISIBLE_DEVICES=${i} save_raw "memtest_shmoo_gpu${i}" \
                 "${cuda_bin}/bandwidthTest" --device=${i} --memory=device --mode=shmoo
         else
@@ -946,24 +1028,24 @@ test_memory() {
         fi
     done
 
-    log_ok "显存主动校验测试完成"
+    log_ok "显存校验测试完成"
 }
 
 # =========================================
-# 13.5 满载烧机+正确性校验（gpu-burn: 矩阵乘法结果比对）
-#   gpu-burn 对每块GPU持续运行大矩阵乘法，
-#   计算结果与CPU参考值逐元素比对，任何不匹配=计算单元故障
-#   这与dcgmi diag -r 3中的Targeted Stress互补，是出厂质检必跑项
+# 13.5 满载烧机+正确性校验
+#   [原厂] dcgmi diag -r 3 的 Targeted Stress 已在第11步运行
+#   [第三方] gpu-burn: 矩阵乘法结果与CPU基准逐元素比对（补充烧机）
+#   两者互补，出厂质检必跑项
 # =========================================
 test_gpu_burn() {
-    log_info "========== 13.5 满载烧机+正确性校验（gpu-burn） =========="
+    log_info "========== 13.5 满载烧机+正确性校验 =========="
     local factory_bin
     factory_bin=$(cat "${OUTPUT_DIR}/factory_bin_dir.txt" 2>/dev/null)
     local gpu_count
     gpu_count=$(cat "${OUTPUT_DIR}/gpu_count.txt")
 
     if [ ! -x "${factory_bin}/gpu_burn" ]; then
-        log_warn "gpu_burn 不可用，跳过正确性烧机测试"
+        log_warn "[第三方] gpu_burn 不可用，跳过（原厂dcgmi diag -r 3已在第11步覆盖压力测试）"
         return
     fi
 
@@ -977,7 +1059,7 @@ test_gpu_burn() {
     # 逐GPU烧机（确保每块GPU都被独立校验）
     for (( i=0; i<gpu_count; i++ )); do
         local burn_time=120  # 每块GPU烧120秒，售后服务建议120~300秒
-        log_info "GPU ${i}: gpu-burn 满载烧机 ${burn_time} 秒（含矩阵乘法正确性校验）..."
+        log_info "GPU ${i}: [第三方] gpu-burn 满载烧机 ${burn_time} 秒（含矩阵乘法正确性校验）..."
         CUDA_VISIBLE_DEVICES=${i} save_raw "gpu_burn_gpu${i}" \
             "${factory_bin}/gpu_burn" "${burn_time}" "${i}"
     done
