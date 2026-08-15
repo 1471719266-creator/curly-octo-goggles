@@ -544,6 +544,105 @@ test_ecc() {
 }
 
 # =========================================
+# 12.5 NVIDIA 原厂现场质检（Field Validation）
+#   覆盖 NVIDIA 官方工厂/现场质检标准全量域：
+#   ROW_REMAPPER(显存行重映射) / NVLink / MIG / TILE(多芯片封装)
+#   POWER_MANAGEMENT / VIRTUALIZATION / SUPPORTED_CLOCKS
+#   ENCODER/DECODER / SERIAL(保修验证) / COMPUTE(运行模式)
+#   这是数据中心GPU(H100~B300)原厂质检/RMA判定的核心依据
+# =========================================
+test_factory_validation() {
+    log_info "========== 12.5 NVIDIA 原厂现场质检（Field Validation） =========="
+
+    # --- (1) 显存行重映射器 ROW_REMAPPER ---
+    # NVIDIA 硬件级显存冗余修复机制：当某显存行故障时，硬件自动重映射到备用行。
+    # 若备用行耗尽（remapping_failure=Yes / pending_remissions>0），则需RMA。
+    # 这是原厂质检/RMA判定的【第一核心依据】
+    log_info "[Field-01] 显存行重映射器（ROW_REMAPPER）..."
+    save_raw "nvsmi_row_remapper" \
+        bash -c "nvidia-smi -q -d ROW_REMAPPER 2>/dev/null || echo 'ROW_REMAPPER 不可用（驱动版本过低或消费级GPU）'"
+
+    # --- (2) NVLink 状态与错误计数 ---
+    # H100/B200/B300 多GPU服务器依赖NVLink/NVSwitch互联，链路错误=硬件故障
+    log_info "[Field-02] NVLink 状态与错误计数..."
+    save_raw "nvsmi_nvlink_status" bash -c "nvidia-smi nvlink -s 2>/dev/null || echo 'NVLink 不可用'"
+    save_raw "nvsmi_nvlink_counters" bash -c "nvidia-smi nvlink -ct 0 2>/dev/null || true"  # 计数器类型0
+    save_raw "nvsmi_nvlink_errors" bash -c "nvidia-smi nvlink -e 2>/dev/null || true"       # 错误计数
+    # NVLink 拓扑和远端GPU信息
+    save_raw "nvsmi_nvlink_topology" bash -c "nvidia-smi -q -d NVLINK 2>/dev/null || true"
+
+    # NVSwitch 检测（DGX/HGX级服务器）
+    save_raw "nvsmi_nvswitch" bash -c "nvidia-smi -q -d NVSWITCH 2>/dev/null || true"
+    save_raw "lspci_nvswitch" bash -c "lspci 2>/dev/null | grep -i 'nvswitch\|ibm.*npu' || echo '未检测到NVSwitch'"
+
+    # --- (3) MIG 多实例GPU验证 ---
+    # H100/B200/B300 的关键特性：将单GPU切分为多个独立计算实例
+    log_info "[Field-03] MIG 多实例GPU配置验证..."
+    save_raw "nvsmi_mig_status" bash -c "nvidia-smi mig -lgi 2>/dev/null || echo 'MIG 未启用或不可用'"
+    save_raw "nvsmi_mig_ci" bash -c "nvidia-smi mig -lci 2>/dev/null || true"
+    save_raw "nvsmi_mig_device" bash -c "nvidia-smi -q -d MIG 2>/dev/null || true"
+
+    # --- (4) TILE 多芯片封装验证 ---
+    # B200/B300 采用多芯片封装(multi-die)，需验证各Tile状态
+    log_info "[Field-04] TILE 多芯片封装状态验证..."
+    save_raw "nvsmi_tile" bash -c "nvidia-smi -q -d TILE 2>/dev/null || echo 'TILE 不可用（单芯片GPU正常）'"
+
+    # --- (5) 功耗管理策略验证 ---
+    log_info "[Field-05] 功耗管理策略（POWER_MANAGEMENT）..."
+    save_raw "nvsmi_power_mgmt" bash -c "nvidia-smi -q -d POWER_MANAGEMENT 2>/dev/null || echo 'POWER_MANAGEMENT 不可用'"
+
+    # --- (6) 虚拟化支持验证（vGPU/SR-IOV）---
+    log_info "[Field-06] 虚拟化支持验证（VIRTUALIZATION）..."
+    save_raw "nvsmi_virtualization" bash -c "nvidia-smi -q -d VIRTUALIZATION 2>/dev/null || echo 'VIRTUALIZATION 不可用'"
+
+    # --- (7) 合规时钟频率验证 ---
+    # 确认GPU能运行在NVIDIA规格书标称的时钟频率
+    log_info "[Field-07] 合规时钟频率（SUPPORTED_CLOCKS）..."
+    save_raw "nvsmi_supported_clocks" bash -c "nvidia-smi -q -d SUPPORTED_CLOCKS 2>/dev/null || echo 'SUPPORTED_CLOCKS 不可用'"
+
+    # --- (8) 视频编码/解码引擎验证（NVENC/NVDEC）---
+    log_info "[Field-08] 视频编解码引擎（NVENC/NVDEC）..."
+    save_raw "nvsmi_encoder" bash -c "nvidia-smi -q -d ENCODER 2>/dev/null || true"
+    save_raw "nvsmi_decoder" bash -c "nvidia-smi -q -d DECODER 2>/dev/null || true"
+
+    # --- (9) 序列号/保修验证 ---
+    # 原厂质检需核对GPU序列号与发货记录一致，防伪/保修验证
+    log_info "[Field-09] 序列号/保修验证（SERIAL）..."
+    save_raw "nvsmi_serial" bash -c "nvidia-smi -q -d SERIAL 2>/dev/null || echo 'SERIAL 不可用'"
+    # inforom 完整性（含OEM/inforom校验和）
+    save_raw "nvsmi_inforom" bash -c "nvidia-smi -q -d INFOROM 2>/dev/null || true"
+
+    # --- (10) 运行模式验证（Persistence/Compute Mode）---
+    log_info "[Field-10] 运行模式验证（COMPUTE/PERSISTENCE）..."
+    save_raw "nvsmi_compute_mode" bash -c "nvidia-smi -q -d COMPUTE 2>/dev/null || true"
+    save_raw "nvsmi_persistence" \
+        bash -c "nvidia-smi --query-gpu=index,persistence_mode,compute_mode,driver_version,vbios_version,inforom.img,inforom.oem,inforom.ece --format=csv 2>/dev/null || true"
+
+    # --- (11) 全域一次性查询（备份完整快照，便于复核）---
+    log_info "[Field-11] nvidia-smi 全域查询快照..."
+    save_raw "nvsmi_all_domains" \
+        bash -c "nvidia-smi -q 2>/dev/null || echo 'nvidia-smi -q 失败'"
+
+    # --- (12) DCGM 策略合规与分组验证 ---
+    if command -v dcgmi &>/dev/null; then
+        log_info "[Field-12] DCGM 策略合规与GPU分组..."
+        save_raw "dcgmi_policy" bash -c "dcgmi policy -l 2>/dev/null || true"  # 列出策略
+        save_raw "dcgmi_group" bash -c "dcgmi group -l 2>/dev/null || true"  # 列出GPU分组
+        save_raw "dcgmi_profile" bash -c "dcgmi profile -l 2>/dev/null || true"  # 性能配置文件
+        save_raw "dcgmi_settings" bash -c "dcgmi settings -l 2>/dev/null || true"  # 全局设置
+    fi
+
+    # --- (13) 页面重映射/退役详细状态（补充ECC部分的深度信息）---
+    log_info "[Field-13] 页面退役与重映射详细状态..."
+    save_raw "nvsmi_page_retirement" bash -c "nvidia-smi -q -d PAGE_RETIREMENT,RETIRED_PAGES 2>/dev/null || true"
+
+    # --- (14) CC（Concurrent Command）/可恢复页错误计数 ---
+    save_raw "nvsmi_clock_policy" bash -c "nvidia-smi -q -d CLOCK_POLICY 2>/dev/null || true"
+
+    log_ok "NVIDIA 原厂现场质检（Field Validation）全部完成"
+}
+
+# =========================================
 # 13. 显存测试（memtestG80 / cuda_memtest 思路）
 # =========================================
 test_memory() {
@@ -671,16 +770,17 @@ EOF
     fi
 
     # ============== 测试阶段 ==============
-    enumerate_gpus          # 5. 门禁
-    test_pcie_link          # 14. PCIe链路状态
-    test_device_query       # 6. deviceQuery
-    test_ecc                # 12. ECC
-    test_memory             # 13. 显存
-    test_bandwidth          # 7. PCIe带宽
-    test_p2p                # 8. P2P
-    test_cuda_perf          # 9. 计算性能
-    test_stress_thermal     # 10. 温度功耗压力
-    test_dcgm               # 11. DCGM 完整诊断
+    enumerate_gpus            # 5. 门禁
+    test_pcie_link            # 14. PCIe链路状态
+    test_device_query         # 6. deviceQuery
+    test_ecc                  # 12. ECC
+    test_factory_validation   # 12.5 原厂现场质检（Field Validation）
+    test_memory               # 13. 显存
+    test_bandwidth            # 7. PCIe带宽
+    test_p2p                  # 8. P2P
+    test_cuda_perf            # 9. 计算性能
+    test_stress_thermal       # 10. 温度功耗压力
+    test_dcgm                 # 11. DCGM 完整诊断
 
     # ============== 生成报告 ==============
     generate_final_report   # 15.

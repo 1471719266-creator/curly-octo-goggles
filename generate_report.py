@@ -429,6 +429,94 @@ def classify_gpu_level(product_name: str) -> str:
         return "其他/未分类"
 
 
+def parse_row_remapper(path: Path) -> Dict[str, Any]:
+    """解析 nvidia-smi -q -d ROW_REMAPPER 输出
+    核心质检项：显存行重映射（硬件级冗余修复）
+    - remapped_rows > 0: 已有行被重映射（显存有故障行，但硬件已修复）
+    - remapping_failure = Yes: 备用行耗尽，无法修复 → 需RMA
+    - pending_remissions > 0: 有待处理的重映射 → 接近RMA
+    """
+    text = safe_read(path)
+    result: Dict[str, Any] = {"raw": text[:3000], "gpus": {}}
+    if not text:
+        return result
+    # 按GPU分块（每个GPU的ROW_REMAPPER块以 "GPU 0000:" 或 "Remapped Rows" 开头）
+    blocks = re.split(r"(?=GPU\s+\d+:|GPU 0000:)", text)
+    for block in blocks:
+        gpu_match = re.search(r"GPU\s+(?:0000:)?([0-9A-Fa-f:]+)", block)
+        gpu_id = gpu_match.group(1) if gpu_match else str(len(result["gpus"]))
+        gpu_data: Dict[str, Any] = {}
+        m = re.search(r"Remapped Rows\s*:\s*(\d+)", block)
+        if m:
+            gpu_data["remapped_rows"] = int(m.group(1))
+        m = re.search(r"Maximum Remapped Rows\s*:\s*(\d+)", block, re.IGNORECASE)
+        if m:
+            gpu_data["max_remapped_rows"] = int(m.group(1))
+        m = re.search(r"Remapping Failure\s*:\s*(\w+)", block, re.IGNORECASE)
+        if m:
+            gpu_data["remapping_failure"] = m.group(1)
+        m = re.search(r"Pending Remissions\s*:\s*(\d+)", block, re.IGNORECASE)
+        if m:
+            gpu_data["pending_remissions"] = int(m.group(1))
+        m = re.search(r"Bank Remappings?\s*:\s*(.*)", block, re.IGNORECASE)
+        if m:
+            gpu_data["bank_remappings"] = m.group(1).strip()
+        m = re.search(r"Maximum Bank Remappings?\s*:\s*(\d+)", block, re.IGNORECASE)
+        if m:
+            gpu_data["max_bank_remappings"] = int(m.group(1))
+        if gpu_data:
+            result["gpus"][gpu_id] = gpu_data
+    return result
+
+
+def parse_nvlink(path_status: Path, path_errors: Path, path_topology: Path) -> Dict[str, Any]:
+    """解析NVLink状态与错误计数"""
+    result: Dict[str, Any] = {
+        "status_raw": safe_read(path_status)[:3000],
+        "errors_raw": safe_read(path_errors)[:3000],
+        "topology_raw": safe_read(path_topology)[:3000],
+        "has_errors": False,
+        "link_count": 0,
+    }
+    status = result["status_raw"]
+    errors = result["errors_raw"]
+    # 统计活跃NVLink数
+    result["link_count"] = len(re.findall(r"Link\s+\d+.*Active", status, re.IGNORECASE))
+    result["total_links"] = len(re.findall(r"Link\s+\d+", status, re.IGNORECASE))
+    # 检查错误
+    if "error" in errors.lower() and "0" not in re.findall(r"error.*?(\d+)", errors, re.IGNORECASE)[-1:]:
+        result["has_errors"] = True
+    # 检查降级链路
+    if re.search(r"Inactive|Down|Disabled", status, re.IGNORECASE):
+        result["has_degraded_links"] = True
+    else:
+        result["has_degraded_links"] = False
+    return result
+
+
+def parse_mig(path_status: Path, path_ci: Path) -> Dict[str, Any]:
+    """解析MIG配置状态"""
+    result: Dict[str, Any] = {
+        "status_raw": safe_read(path_status)[:2000],
+        "ci_raw": safe_read(path_ci)[:2000],
+        "enabled": False,
+        "gi_count": 0,
+        "ci_count": 0,
+    }
+    if "No MIG" in result["status_raw"] or "not" in result["status_raw"].lower():
+        return result
+    result["gi_count"] = len(re.findall(r"GPU instance\s*ID\s*:", result["status_raw"], re.IGNORECASE))
+    result["ci_count"] = len(re.findall(r"Compute instance\s*ID\s*:", result["ci_raw"], re.IGNORECASE))
+    result["enabled"] = result["gi_count"] > 0
+    return result
+
+
+def parse_nvsmi_domain(path: Path, domain_name: str) -> Dict[str, Any]:
+    """通用 nvidia-smi -q -d 域解析器"""
+    text = safe_read(path)
+    return {"raw": text[:3000], "available": bool(text.strip()) and "not available" not in text.lower()}
+
+
 def determine_pass_fail(data: Dict[str, Any]) -> Tuple[bool, List[str]]:
     """
     核心售后服务判定逻辑：
@@ -532,6 +620,36 @@ def determine_pass_fail(data: Dict[str, Any]) -> Tuple[bool, List[str]]:
                     issues.append(f"{label} 检测到严重Xid错误: {line.strip()}")
                     break
 
+        # --- 原厂质检：显存行重映射器（ROW_REMAPPER）---
+        # 这是NVIDIA原厂质检/RMA判定的第一核心依据
+        row_remapper = data.get("row_remapper", {}).get("gpus", {})
+        for gpu_id, rr in row_remapper.items():
+            if gpu_id == str(idx) or gpu_id == gpu.get("pci_bus_id", ""):
+                failure = rr.get("remapping_failure", "")
+                if str(failure).lower() in ("yes", "true", "1"):
+                    issues.append(f"{label} 显存行重映射失败(remapping_failure=Yes) — 备用行已耗尽，【立即RMA】")
+                pending = rr.get("pending_remissions", 0)
+                if isinstance(pending, int) and pending > 0:
+                    issues.append(f"{label} 待处理重映射数={pending} — 备用行即将耗尽，建议RMA")
+                remapped = rr.get("remapped_rows", 0)
+                max_rr = rr.get("max_remapped_rows", 0)
+                if isinstance(remapped, int) and isinstance(max_rr, int) and max_rr > 0:
+                    ratio = remapped / max_rr
+                    if ratio > 0.5:
+                        issues.append(f"{label} 显存行重映射消耗率={remapped}/{max_rr} ({ratio:.0%}) — 超过50%，建议RMA")
+                    elif remapped > 0:
+                        issues.append(f"{label} 显存已重映射{remapped}/{max_rr}行 — 有故障行但硬件已修复，跟踪观察")
+
+        # --- 原厂质检：NVLink 错误 ---
+        nvlink = data.get("nvlink", {})
+        if nvlink.get("has_degraded_links"):
+            total = nvlink.get("total_links", 0)
+            active = nvlink.get("link_count", 0)
+            if total > active:
+                issues.append(f"{label} NVLink有链路降级: 活跃{active}/{total} — 检查NVLink线缆/NVSwitch")
+        if nvlink.get("has_errors"):
+            issues.append(f"{label} NVLink检测到错误计数 — 检查互联链路完整性")
+
     return (len(issues) == 0), issues
 
 
@@ -623,6 +741,48 @@ def build_data(output_dir: Path, raw_dir: Path, log_file: Path) -> Dict[str, Any
     data["dcgm_diag"] = parse_dcgm_diag(raw_dir / "dcgmi_diag_full.txt")
     data["dcgm_health"] = safe_read(raw_dir / "dcgmi_health.txt")[:4000]
     data["dcgm_stats"] = safe_read(raw_dir / "dcgmi_stats.txt")[:6000]
+
+    # ===== 原厂现场质检（Field Validation）数据 =====
+    # ROW_REMAPPER（显存行重映射——RMA判定核心）
+    data["row_remapper"] = parse_row_remapper(raw_dir / "nvsmi_row_remapper.txt")
+
+    # NVLink 状态/错误
+    data["nvlink"] = parse_nvlink(
+        raw_dir / "nvsmi_nvlink_status.txt",
+        raw_dir / "nvsmi_nvlink_errors.txt",
+        raw_dir / "nvsmi_nvlink_topology.txt",
+    )
+
+    # MIG 多实例GPU
+    data["mig"] = parse_mig(
+        raw_dir / "nvsmi_mig_status.txt",
+        raw_dir / "nvsmi_mig_ci.txt",
+    )
+
+    # 各域查询（原厂质检补充项）
+    data["field_validation"] = {
+        "row_remapper": data["row_remapper"],
+        "nvlink": data["nvlink"],
+        "mig": data["mig"],
+        "tile": parse_nvsmi_domain(raw_dir / "nvsmi_tile.txt", "TILE"),
+        "power_management": parse_nvsmi_domain(raw_dir / "nvsmi_power_mgmt.txt", "POWER_MANAGEMENT"),
+        "virtualization": parse_nvsmi_domain(raw_dir / "nvsmi_virtualization.txt", "VIRTUALIZATION"),
+        "supported_clocks": parse_nvsmi_domain(raw_dir / "nvsmi_supported_clocks.txt", "SUPPORTED_CLOCKS"),
+        "encoder": parse_nvsmi_domain(raw_dir / "nvsmi_encoder.txt", "ENCODER"),
+        "decoder": parse_nvsmi_domain(raw_dir / "nvsmi_decoder.txt", "DECODER"),
+        "serial": safe_read(raw_dir / "nvsmi_serial.txt")[:2000],
+        "inforom": safe_read(raw_dir / "nvsmi_inforom.txt")[:2000],
+        "compute_mode": safe_read(raw_dir / "nvsmi_compute_mode.txt")[:2000],
+        "persistence": parse_csv_like(safe_read(raw_dir / "nvsmi_persistence.txt")),
+        "clock_policy": safe_read(raw_dir / "nvsmi_clock_policy.txt")[:2000],
+        "page_retirement": safe_read(raw_dir / "nvsmi_page_retirement.txt")[:2000],
+        "nvswitch": safe_read(raw_dir / "nvsmi_nvswitch.txt")[:2000],
+        "lspci_nvswitch": safe_read(raw_dir / "lspci_nvswitch.txt")[:1000],
+        "all_domains_snapshot": safe_read(raw_dir / "nvsmi_all_domains.txt")[:4000],
+        "dcgmi_policy": safe_read(raw_dir / "dcgmi_policy.txt")[:2000],
+        "dcgmi_group": safe_read(raw_dir / "dcgmi_group.txt")[:2000],
+        "dcgmi_profile": safe_read(raw_dir / "dcgmi_profile.txt")[:2000],
+    }
 
     # 售后判定
     passed, issues = determine_pass_fail(data)
@@ -886,7 +1046,134 @@ summary{{cursor:pointer;color:#1565c0;font-weight:bold;padding:4px;}}
 <pre>{data.get('dcgm_stats','')}</pre>
 </details>
 
-<h2>九、系统内核日志 (Xid 错误筛查)</h2>
+<h2>九、NVIDIA 原厂现场质检（Field Validation）</h2>
+<p class="small">以下数据来自 nvidia-smi -q -d 全域查询，覆盖 NVIDIA 原厂工厂/现场质检标准全量域。这是数据中心GPU(H100~B300)原厂质检/RMA判定的核心依据。</p>
+
+<h3>9.1 显存行重映射器（ROW_REMAPPER）— RMA判定核心</h3>
+<p class="small">NVIDIA硬件级显存冗余修复机制：当显存行故障时自动重映射到备用行。备用行耗尽(remapping_failure=Yes)或消耗率>50% → 需RMA</p>
+{
+    (lambda rr: html_table_from_dicts([
+        {"GPU ID": gid, "已重映射行": d.get("remapped_rows","—"), "最大重映射行": d.get("max_remapped_rows","—"),
+         "重映射失败": f'<span style="color:#c62828;font-weight:bold;">{d.get("remapping_failure","—")}</span>' if str(d.get("remapping_failure","")).lower() in ("yes","true","1") else str(d.get("remapping_failure","—")),
+         "待处理重映射": d.get("pending_remissions","—"), "Bank重映射": str(d.get("bank_remappings","—"))[:60]}
+        for gid, d in (rr.get("gpus",{}) or {}).items()
+    ]) if rr.get("gpus") else "<p><em>ROW_REMAPPER 无数据（驱动版本过低或非数据中心GPU）</em></p>")(data.get("row_remapper",{}))
+}
+<details class="raw-section">
+<summary>ROW_REMAPPER 原始输出</summary>
+<pre>{data.get('row_remapper',{}).get('raw','')}</pre>
+</details>
+
+<h3>9.2 NVLink 互联状态与错误计数</h3>
+<p class="small">H100/B200/B300多GPU服务器依赖NVLink/NVSwitch互联，链路降级或错误=硬件故障</p>
+{
+    (lambda nv: (
+        f'<p>活跃NVLink数: {nv.get("link_count",0)} / 总链路数: {nv.get("total_links",0)}'
+        + (f' <span style="color:#c62828;font-weight:bold;">检测到链路降级</span>' if nv.get("has_degraded_links") else ' <span style="color:#2e7d32;">链路正常</span>')
+        + (f' <span style="color:#c62828;">检测到错误计数</span>' if nv.get("has_errors") else '')
+    ))(data.get("nvlink",{}))
+}
+<details class="raw-section">
+<summary>NVLink 状态 (nvidia-smi nvlink -s)</summary>
+<pre>{data.get('nvlink',{}).get('status_raw','')}</pre>
+</details>
+<details class="raw-section">
+<summary>NVLink 错误计数 (nvidia-smi nvlink -e)</summary>
+<pre>{data.get('nvlink',{}).get('errors_raw','')}</pre>
+</details>
+<details class="raw-section">
+<summary>NVLink 拓扑 (nvidia-smi -q -d NVLINK)</summary>
+<pre>{data.get('nvlink',{}).get('topology_raw','')}</pre>
+</details>
+<details class="raw-section">
+<summary>NVSwitch 检测</summary>
+<pre>{data.get('field_validation',{}).get('nvswitch','')}</pre>
+<pre>{data.get('field_validation',{}).get('lspci_nvswitch','')}</pre>
+</details>
+
+<h3>9.3 MIG 多实例GPU配置</h3>
+<p class="small">H100/B200/B300关键特性：将单GPU切分为多个独立计算实例。用于验证MIG功能完整性</p>
+{
+    (lambda mig: (
+        f'<p>MIG状态: {"已启用" if mig.get("enabled") else "未启用/不可用"} | GPU实例数: {mig.get("gi_count",0)} | 计算实例数: {mig.get("ci_count",0)}</p>'
+    ))(data.get("mig",{}))
+}
+<details class="raw-section">
+<summary>MIG GPU实例列表 (nvidia-smi mig -lgi)</summary>
+<pre>{data.get('mig',{}).get('status_raw','')}</pre>
+</details>
+<details class="raw-section">
+<summary>MIG 计算实例列表 (nvidia-smi mig -lci)</summary>
+<pre>{data.get('mig',{}).get('ci_raw','')}</pre>
+</details>
+
+<h3>9.4 多芯片封装验证（TILE）— B200/B300</h3>
+<details class="raw-section">
+<summary>TILE 域查询 (nvidia-smi -q -d TILE)</summary>
+<pre>{data.get('field_validation',{}).get('tile',{}).get('raw','') if isinstance(data.get('field_validation',{}).get('tile'), dict) else data.get('field_validation',{}).get('tile','')}</pre>
+</details>
+
+<h3>9.5 功耗管理 / 虚拟化 / 合规时钟 / 编解码引擎</h3>
+<details class="raw-section">
+<summary>功耗管理策略 (POWER_MANAGEMENT)</summary>
+<pre>{data.get('field_validation',{}).get('power_management',{}).get('raw','') if isinstance(data.get('field_validation',{}).get('power_management'), dict) else ''}</pre>
+</details>
+<details class="raw-section">
+<summary>虚拟化支持 (VIRTUALIZATION)</summary>
+<pre>{data.get('field_validation',{}).get('virtualization',{}).get('raw','') if isinstance(data.get('field_validation',{}).get('virtualization'), dict) else ''}</pre>
+</details>
+<details class="raw-section">
+<summary>合规时钟频率 (SUPPORTED_CLOCKS)</summary>
+<pre>{data.get('field_validation',{}).get('supported_clocks',{}).get('raw','') if isinstance(data.get('field_validation',{}).get('supported_clocks'), dict) else ''}</pre>
+</details>
+<details class="raw-section">
+<summary>视频编码引擎 NVENC (ENCODER)</summary>
+<pre>{data.get('field_validation',{}).get('encoder',{}).get('raw','') if isinstance(data.get('field_validation',{}).get('encoder'), dict) else ''}</pre>
+</details>
+<details class="raw-section">
+<summary>视频解码引擎 NVDEC (DECODER)</summary>
+<pre>{data.get('field_validation',{}).get('decoder',{}).get('raw','') if isinstance(data.get('field_validation',{}).get('decoder'), dict) else ''}</pre>
+</details>
+
+<h3>9.6 序列号 / 保修验证 / InfoROM 完整性</h3>
+<p class="small">原厂质检需核对GPU序列号与发货记录一致；InfoROM校验和确认固件未被篡改</p>
+{html_table_from_dicts(data.get('field_validation',{}).get('persistence',[]))}
+<details class="raw-section">
+<summary>序列号 (SERIAL)</summary>
+<pre>{data.get('field_validation',{}).get('serial','')}</pre>
+</details>
+<details class="raw-section">
+<summary>InfoROM 完整性 (INFOROM)</summary>
+<pre>{data.get('field_validation',{}).get('inforom','')}</pre>
+</details>
+
+<h3>9.7 运行模式 / 页面退役详细 / DCGM策略合规</h3>
+<details class="raw-section">
+<summary>Compute Mode / Persistence Mode</summary>
+<pre>{data.get('field_validation',{}).get('compute_mode','')}</pre>
+</details>
+<details class="raw-section">
+<summary>页面退役与重映射详细 (PAGE_RETIREMENT)</summary>
+<pre>{data.get('field_validation',{}).get('page_retirement','')}</pre>
+</details>
+<details class="raw-section">
+<summary>时钟策略 (CLOCK_POLICY)</summary>
+<pre>{data.get('field_validation',{}).get('clock_policy','')}</pre>
+</details>
+<details class="raw-section">
+<summary>DCGM 策略合规 (dcgmi policy -l)</summary>
+<pre>{data.get('field_validation',{}).get('dcgmi_policy','')}</pre>
+</details>
+<details class="raw-section">
+<summary>DCGM GPU分组 (dcgmi group -l)</summary>
+<pre>{data.get('field_validation',{}).get('dcgmi_group','')}</pre>
+</details>
+<details class="raw-section">
+<summary>DCGM 性能配置文件 (dcgmi profile -l)</summary>
+<pre>{data.get('field_validation',{}).get('dcgmi_profile','')}</pre>
+</details>
+
+<h2>十、系统内核日志 (Xid 错误筛查)</h2>
 <details class="raw-section">
 <summary>dmesg NVRM/Xid (最近50条)</summary>
 <pre>{chr(10).join(data.get('dmesg_xid',[])) or '(无)'}</pre>
@@ -896,7 +1183,7 @@ summary{{cursor:pointer;color:#1565c0;font-weight:bold;padding:4px;}}
 <pre>{data.get('retired_pages_detail','')}</pre>
 </details>
 
-<h2>十、售后服务签字栏</h2>
+<h2>十一、售后服务签字栏</h2>
 <div class="sign-block">
 <div class="sign-box">客户确认签字<br><br><span style="color:#999;">日期：____/____/____</span></div>
 <div class="sign-box">工程师签字<br><br><span style="color:#999;">日期：____/____/____</span></div>
