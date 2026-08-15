@@ -3,8 +3,26 @@
 # NVIDIA GPU 售后服务自动化测试脚本
 # 支持 Ubuntu 24.04 LTS，兼容 H100 ~ B300 全系列数据中心/消费级 GPU
 # 测试工具：NVIDIA CUDA Toolkit (官方) + DCGM (官方数据中心诊断)
+# 直接复制使用：  bash gpu_test.sh    （首次会自动 chmod +x，下次可 ./gpu_test.sh）
 #===============================================================================
 set -o pipefail
+
+# ================================================================
+# 【第0步：自授权+重启动】复制到任何目录都能 bash gpu_test.sh 直接运行
+#   效果：首次用 bash 运行后，脚本自动给自己 chmod +x
+#        并重启动为可执行模式，以后直接 ./gpu_test.sh 即可
+# ================================================================
+SELF_CHMOD_DONE="${SELF_CHMOD_DONE:-0}"
+if [ "${SELF_CHMOD_DONE}" != "1" ] && [ -f "${BASH_SOURCE[0]}" ]; then
+    SCRIPT_ABS_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+    if [ ! -x "${SCRIPT_ABS_PATH}" ]; then
+        echo ">>> 首次运行：自动给脚本添加可执行权限（chmod +x），以后可直接 ./$(basename "${BASH_SOURCE[0]}")"
+        chmod +x "${SCRIPT_ABS_PATH}" 2>/dev/null || true
+    fi
+    # 通过环境变量避免无限循环，然后以可执行方式重启动
+    export SELF_CHMOD_DONE=1
+    exec "${SCRIPT_ABS_PATH}" "$@"
+fi
 
 # =========================================
 # 配置区（集中管理，便于售后服务追溯）
@@ -18,6 +36,10 @@ DCGM_VERSION="3.4.1"
 STRESS_DURATION_SEC=60   # 压力测试时长(秒)，售后服务建议60~300秒
 FIELD_LEVEL=2            # fieldiag 原厂现场诊断级别: 1=快速(5~15分钟) 2=中等(约4小时) 3=完整(约6小时)
 FORCE_FIELDIAG=false     # 是否强制跳过 fieldiag 预检0~6（确认fieldiag版本+GPU完全匹配时才用）
+TEMP_ALARM_C=90          # 温度报警阈值（℃），超过则自动暂停测试，低于冷却阈值后继续
+TEMP_COOLDOWN_C=75       # 冷却恢复温度（℃），低于此值自动恢复测试
+TEMP_CHECK_INTERVAL=5    # 温度检查间隔(秒)
+PAUSE_MARKER=""          # 暂停标记文件路径，init()里会赋值
 
 # 颜色输出
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
@@ -29,6 +51,93 @@ init() {
     mkdir -p "${OUTPUT_DIR}" "${RAW_DATA_DIR}"
     touch "${LOG_FILE}"
     exec 2> >(tee -a "${LOG_FILE}" >&2)
+    PAUSE_MARKER="${OUTPUT_DIR}/.pause"
+    MANUAL_PAUSE="${OUTPUT_DIR}/.manual_pause"
+    TEMP_WATCHDOG_LOG="${OUTPUT_DIR}/watchdog_temp.log"
+    rm -f "${PAUSE_MARKER}" "${MANUAL_PAUSE}" "${TEMP_WATCHDOG_LOG}"
+}
+
+# ================================================================
+# 启动交互菜单（无参数模式）—— 售后服务工程师最常用
+# ================================================================
+interactive_menu() {
+    # 如果不是TTY（比如ssh管道调用），直接使用默认值不交互
+    if [ ! -t 0 ]; then
+        echo "[交互菜单] 非终端环境，使用默认值: fieldiag=Level${FIELD_LEVEL}, 压力=${STRESS_DURATION_SEC}s, 温度报警=${TEMP_ALARM_C}℃"
+        return 0
+    fi
+
+    local sel=""
+    echo ""
+    echo "╔══════════════════════════════════════════════════════════════╗"
+    echo "║    NVIDIA GPU 售后服务自动化测试 · 启动配置                 ║"
+    echo "║    直接回车 = 采用默认值                                     ║"
+    echo "╚══════════════════════════════════════════════════════════════╝"
+
+    # ---- Step 1: fieldiag 等级 ----
+    echo ""
+    echo "【1/4】NVIDIA fieldiag 原厂现场诊断级别（只有装了fieldiag二进制才生效）："
+    echo "    1) Level 1 快速测试  (~5~15 分钟)  ← 日常验收"
+    echo "    2) Level 2 中等深度  (~4 小时)     ← 默认，推荐售后RMA前"
+    echo "    3) Level 3 完整诊断  (~6 小时)     ← 出厂质检/重大故障深挖"
+    read -rp "    请选择 [默认 2]: " sel
+    case "${sel}" in
+        1) FIELD_LEVEL=1 ;;
+        3) FIELD_LEVEL=3 ;;
+        2|"") FIELD_LEVEL=2 ;;
+        *) echo "    无效选择，保留默认 Level 2"; FIELD_LEVEL=2 ;;
+    esac
+
+    # ---- Step 2: 压力测试时长 ----
+    echo ""
+    echo "【2/4】满载压力测试时长（nbody + gpu-burn，售后服务建议 60~300 秒）："
+    echo "    例：60（1分钟）、120（2分钟）、300（5分钟）、600（10分钟）"
+    read -rp "    请输入秒数 [默认 ${STRESS_DURATION_SEC}]: " sel
+    if [ -n "${sel}" ] && [[ "${sel}" =~ ^[0-9]+$ ]] && [ "${sel}" -gt 0 ]; then
+        STRESS_DURATION_SEC="${sel}"
+    else
+        [ -n "${sel}" ] && echo "    无效值，保留默认 ${STRESS_DURATION_SEC} 秒"
+    fi
+
+    # ---- Step 3: 温度报警阈值 ----
+    echo ""
+    echo "【3/4】温度报警阈值（最高温度，超过自动暂停测试；H100/H200/B300建议92，A100建议90，消费级建议85）："
+    echo "    例：80 / 85 / 90 / 92 / 95"
+    read -rp "    请输入摄氏度 [默认 ${TEMP_ALARM_C}]: " sel
+    if [ -n "${sel}" ] && [[ "${sel}" =~ ^[0-9]+$ ]] && [ "${sel}" -ge 50 ] && [ "${sel}" -le 110 ]; then
+        TEMP_ALARM_C="${sel}"
+    else
+        [ -n "${sel}" ] && echo "    无效值（应在 50~110 之间），保留默认 ${TEMP_ALARM_C}℃"
+    fi
+
+    # ---- Step 4: 冷却恢复温度（必须低于报警阈值） ----
+    local default_cool=$(( TEMP_ALARM_C - 15 ))
+    [ "${default_cool}" -lt 40 ] && default_cool=40
+    echo ""
+    echo "【4/4】冷却恢复温度（降到该温度以下自动恢复测试，建议比报警阈值低 10~20℃）："
+    read -rp "    请输入摄氏度 [默认 ${default_cool}]: " sel
+    if [ -n "${sel}" ] && [[ "${sel}" =~ ^[0-9]+$ ]]; then
+        if [ "${sel}" -lt "${TEMP_ALARM_C}" ]; then
+            TEMP_COOLDOWN_C="${sel}"
+        else
+            echo "    恢复温度必须低于报警温度(${TEMP_ALARM_C}℃)，使用默认 ${default_cool}℃"
+            TEMP_COOLDOWN_C="${default_cool}"
+        fi
+    else
+        TEMP_COOLDOWN_C="${default_cool}"
+    fi
+
+    echo ""
+    echo "╔══════════════════════════════════════════════════════════════╗"
+    echo "║  最终配置确认："
+    echo "║   · fieldiag 诊断等级 : Level ${FIELD_LEVEL}"
+    echo "║   · 满载压力时长     : ${STRESS_DURATION_SEC} 秒"
+    echo "║   · 温度报警阈值     : ${TEMP_ALARM_C} ℃（超过自动暂停）"
+    echo "║   · 冷却恢复温度     : ${TEMP_COOLDOWN_C} ℃（低于后自动继续）"
+    echo "║  运行中手动暂停      : touch ${OUTPUT_DIR}/.manual_pause"
+    echo "║  运行中手动恢复      : rm    -f ${OUTPUT_DIR}/.manual_pause"
+    echo "╚══════════════════════════════════════════════════════════════╝"
+    echo ""
 }
 
 log() {
@@ -41,6 +150,92 @@ log_info()  { log "INFO"  "${BLUE}$*${NC}"; }
 log_ok()    { log "OK"    "${GREEN}$*${NC}"; }
 log_warn()  { log "WARN"  "${YELLOW}$*${NC}"; }
 log_error() { log "ERROR" "${RED}$*${NC}"; }
+
+# ================================================================
+# 温度守护进程：后台常驻，每TEMP_CHECK_INTERVAL秒检查一次所有GPU温度
+#   任何一块GPU温度 >= TEMP_ALARM_C → 写入暂停标记 + 报警
+#   所有GPU温度 <= TEMP_COOLDOWN_C → 移除暂停标记 + 继续
+#   支持手动暂停：touch .manual_pause （优先级最高，必须手动删除）
+# ================================================================
+start_temp_watchdog() {
+    # 先杀掉上一次可能残留的watchdog（正常流程下不会残留）
+    [ -f "${OUTPUT_DIR}/.watchdog_pid" ] && kill "$(cat "${OUTPUT_DIR}/.watchdog_pid")" 2>/dev/null || true
+    rm -f "${PAUSE_MARKER}" "${OUTPUT_DIR}/.watchdog_pid"
+
+    # 守护进程以子shell方式后台运行，不阻塞主流程
+    (
+        echo $$ > "${OUTPUT_DIR}/.watchdog_pid"
+        local last_alert_ts=0
+        local last_resume_ts=0
+        while true; do
+            sleep "${TEMP_CHECK_INTERVAL}"
+            # 如果 nvidia-smi 不存在就休息（驱动还没装好）
+            command -v nvidia-smi &>/dev/null || continue
+            # 读每块GPU的最高温度（利用query一次获取）
+            local temps
+            temps=$(nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader,nounits 2>/dev/null || true)
+            [ -z "${temps}" ] && continue
+            local max_t=0 min_t=200
+            while IFS= read -r t; do
+                [[ "${t}" =~ ^[0-9]+$ ]] || continue
+                [ "${t}" -gt "${max_t}" ] && max_t="${t}"
+                [ "${t}" -lt "${min_t}" ] && min_t="${t}"
+            done <<< "${temps}"
+            local now_ts
+            now_ts=$(date +%s)
+            # 写 watchdog 日志（每30秒写一条，避免日志爆炸）
+            if [ $(( now_ts % 30 )) -eq 0 ]; then
+                echo "[$(date '+%H:%M:%S')] max=${max_t}C min=${min_t}C | TEMP_ALARM=${TEMP_ALARM_C}C TEMP_COOLDOWN=${TEMP_COOLDOWN_C}C | PAUSE=$( [ -f "${PAUSE_MARKER}" ] && echo Y || echo N ) | MANUAL=$( [ -f "${MANUAL_PAUSE}" ] && echo Y || echo N )" >> "${TEMP_WATCHDOG_LOG}"
+            fi
+            # --- 手动暂停优先级最高：必须等用户手动删除才恢复 ---
+            if [ -f "${MANUAL_PAUSE}" ]; then
+                touch "${PAUSE_MARKER}"
+                if [ $(( now_ts - last_alert_ts )) -ge 15 ]; then
+                    last_alert_ts=${now_ts}
+                    # 用tee写入主进程log但不能直接调用log_info（子shell），改为直接写log文件
+                    echo -e "[$(date '+%Y-%m-%d %H:%M:%S')][WARN] ${YELLOW}⚠️  手动暂停生效中：请运行 rm -f ${MANUAL_PAUSE} 恢复${NC}" | tee -a "${LOG_FILE}" >&2
+                fi
+                continue
+            fi
+            # --- 温度超阈值：自动暂停 ---
+            if [ "${max_t}" -ge "${TEMP_ALARM_C}" ]; then
+                touch "${PAUSE_MARKER}"
+                if [ $(( now_ts - last_alert_ts )) -ge 10 ]; then
+                    last_alert_ts=${now_ts}
+                    echo -e "[$(date '+%Y-%m-%d %H:%M:%S')][ERROR] ${RED}🔥 温度报警：最高 GPU ${max_t}℃ ≥ 阈值 ${TEMP_ALARM_C}℃，已自动暂停测试${NC}" | tee -a "${LOG_FILE}" >&2
+                fi
+                continue
+            fi
+            # --- 已暂停但温度降到恢复阈值以下：解除自动暂停 ---
+            if [ -f "${PAUSE_MARKER}" ] && [ "${max_t}" -le "${TEMP_COOLDOWN_C}" ] && [ ! -f "${MANUAL_PAUSE}" ]; then
+                rm -f "${PAUSE_MARKER}"
+                if [ $(( now_ts - last_resume_ts )) -ge 5 ]; then
+                    last_resume_ts=${now_ts}
+                    echo -e "[$(date '+%Y-%m-%d %H:%M:%S')][OK] ${GREEN}❄️  已冷却到 ${max_t}℃ ≤ 恢复阈值 ${TEMP_COOLDOWN_C}℃，自动恢复测试${NC}" | tee -a "${LOG_FILE}" >&2
+                fi
+            fi
+        done
+    ) &
+    local wd_pid=$!
+    # 确保整个主流程退出时把后台守护进程一起杀掉（trap 退出信号）
+    trap 'kill '"${wd_pid}"' 2>/dev/null; [ -f "${OUTPUT_DIR}/.watchdog_pid" ] && kill "$(cat "${OUTPUT_DIR}/.watchdog_pid")" 2>/dev/null || true' EXIT INT TERM
+    log_ok "温度守护进程已启动 (PID=${wd_pid})：最高温度≥${TEMP_ALARM_C}℃自动暂停，≤${TEMP_COOLDOWN_C}℃自动恢复"
+    log_info "手动控制：暂停=touch ${MANUAL_PAUSE}  恢复=rm -f ${MANUAL_PAUSE}  状态=${PAUSE_MARKER}"
+}
+
+# ================================================================
+# 长时测试前的检查点：
+#   如果存在暂停标记（温度超阈值 or 手动）就 sleep 等待直到标记清除
+# ================================================================
+wait_for_ready() {
+    local caller_name="${1:-测试}"
+    if [ -f "${MANUAL_PAUSE}" ]; then
+        log_warn "⚠️  ${caller_name}：手动暂停生效，等待用户执行 rm -f ${MANUAL_PAUSE}"
+    fi
+    while [ -f "${PAUSE_MARKER}" ] || [ -f "${MANUAL_PAUSE}" ]; do
+        sleep 2
+    done
+}
 
 # 保存原始命令输出到文件，便于报告生成溯源
 save_raw() {
@@ -745,6 +940,7 @@ test_cuda_perf() {
 # 10. 温度/功耗/稳定性压力测试（售后服务核心项）
 # =========================================
 test_stress_thermal() {
+    wait_for_ready "nbody满载压力测试"
     log_info "========== 10. 温度/功耗/稳定性压力测试（${STRESS_DURATION_SEC}秒） =========="
     local bin_dir
     bin_dir=$(cat "${OUTPUT_DIR}/cuda_bin_dir.txt" 2>/dev/null)
@@ -1150,6 +1346,8 @@ test_fieldiag() {
 
     fi   # <-- 结束 FORCE_FIELDIAG 的 else 分支
 
+    wait_for_ready "fieldiag Level ${FIELD_LEVEL} 原厂现场诊断"
+
     # 根据 FIELD_LEVEL 确定参数和超时
     local fieldiag_args=""
     local fieldiag_timeout=21600
@@ -1416,6 +1614,7 @@ test_memory() {
 #   两者互补，出厂质检必跑项
 # =========================================
 test_gpu_burn() {
+    wait_for_ready "gpu-burn满载烧机"
     log_info "========== 13.5 满载烧机+正确性校验 =========="
     local factory_bin
     factory_bin=$(cat "${OUTPUT_DIR}/factory_bin_dir.txt" 2>/dev/null)
@@ -1539,8 +1738,33 @@ EOF
         esac
     done
 
+    # ================================================================
+    # 启动交互菜单：无命令行参数时显示（售后服务工程师最常用模式）
+    # 覆盖：fieldiag等级、压力时长、温度报警阈值、冷却阈值
+    # ================================================================
+    if [ $# -eq 0 ]; then
+        interactive_menu
+    fi
+
     init
     log_info "输出目录: ${OUTPUT_DIR}"
+    log_info "参数设置: fieldiag等级=Level ${FIELD_LEVEL} | 压力时长=${STRESS_DURATION_SEC}秒 | 温度报警=${TEMP_ALARM_C}℃ | 冷却恢复=${TEMP_COOLDOWN_C}℃"
+    # 写入配置供报告查阅
+    {
+        echo "fieldiag_level: Level ${FIELD_LEVEL}"
+        echo "stress_duration_sec: ${STRESS_DURATION_SEC}"
+        echo "temp_alarm_c: ${TEMP_ALARM_C}"
+        echo "temp_cooldown_c: ${TEMP_COOLDOWN_C}"
+        echo "force_fieldiag: ${FORCE_FIELDIAG}"
+        echo "skip_install: ${skip_install}"
+        echo "stress_only: ${stress_only}"
+        echo "start_ts: $(date '+%Y-%m-%d %H:%M:%S')"
+    } > "${OUTPUT_DIR}/run_config.yml"
+    log_info "手动暂停: 另开终端运行 touch ${OUTPUT_DIR}/.manual_pause"
+    log_info "手动恢复: 另开终端运行 rm   -f  ${OUTPUT_DIR}/.manual_pause"
+
+    # 启动温度守护进程（此时PAUSE_MARKER路径已在init()内设置好）
+    start_temp_watchdog
 
     if [ "${stress_only}" = "true" ]; then
         install_system_deps
