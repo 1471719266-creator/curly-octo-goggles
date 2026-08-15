@@ -17,6 +17,7 @@ CUDA_VERSION="12.6.1"  # 支持 H100/B200/B300 等最新GPU的稳定CUDA版本
 DCGM_VERSION="3.4.1"
 STRESS_DURATION_SEC=60   # 压力测试时长(秒)，售后服务建议60~300秒
 FIELD_LEVEL=2            # fieldiag 原厂现场诊断级别: 1=快速(5~15分钟) 2=中等(约4小时) 3=完整(约6小时)
+FORCE_FIELDIAG=false     # 是否强制跳过 fieldiag 预检0~6（确认fieldiag版本+GPU完全匹配时才用）
 
 # 颜色输出
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
@@ -918,6 +919,18 @@ test_fieldiag() {
 
     log_ok "找到 fieldiag: ${fieldiag_bin}"
 
+    # 【强制模式】--force-fieldiag：完全跳过预检0~6，直接进入正式诊断
+    # 仅在确认 fieldiag 版本和GPU完全匹配时使用
+    if [ "${FORCE_FIELDIAG}" = "true" ]; then
+        log_warn "⚠️  --force-fieldiag 模式：跳过全部预检（GPU产品线/30秒快速预检/二进制兼容）"
+        log_warn "⚠️  如 fieldiag 版本与GPU不匹配，可能卡死数小时，请耐心等待或 Ctrl+C 终止"
+        log_info "ℹ️  直接进入 Level ${FIELD_LEVEL} 正式诊断..."
+        # 写入基础文件占位，避免报告缺字段
+        echo "FORCE" > "${RAW_DATA_DIR}/fieldiag_precheck.txt"
+        "$fieldiag_bin" --version > "${RAW_DATA_DIR}/fieldiag_version.txt" 2>&1 || true
+        ldd "${fieldiag_bin}" > "${RAW_DATA_DIR}/fieldiag_ldd.txt" 2>&1 || true
+    else
+
     # ================================================================
     # 预检0：GPU产品线过滤 —— 消费级GPU（RTX/GTX/TITAN 等）直接跳过，不浪费时间
     #   fieldiag 官方仅支持数据中心 GPU：Tesla / HGX / DGX 系列
@@ -1134,6 +1147,8 @@ test_fieldiag() {
         } > "${RAW_DATA_DIR}/fieldiag_diag.txt"
         return
     fi
+
+    fi   # <-- 结束 FORCE_FIELDIAG 的 else 分支
 
     # 根据 FIELD_LEVEL 确定参数和超时
     local fieldiag_args=""
@@ -1485,6 +1500,7 @@ main() {
             --skip-install) skip_install=true ;;
             --stress-only)  stress_only=true  ;;
             --field-level)  shift_next_field_level=true ;;
+            --force-fieldiag) FORCE_FIELDIAG=true ;;
             *)
                 if [ "${shift_next_field_level}" = "true" ]; then
                     FIELD_LEVEL="${arg}"
@@ -1505,6 +1521,8 @@ NVIDIA GPU 售后服务自动化测试脚本
                          1 = 快速测试 (约5~15分钟)
                          2 = 中等深度 (约4小时)
                          3 = 完整诊断 (约6小时)
+  --force-fieldiag     【慎用】强制跳过 fieldiag 所有预检（GPU产品线/30秒快速预检/二进制兼容）
+                       仅在你100%确认fieldiag版本+GPU完全匹配时才用，否则可能卡死数小时
   -h, --help           显示此帮助
 
 输出目录:
