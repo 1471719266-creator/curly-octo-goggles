@@ -33,7 +33,8 @@ LOG_FILE="${OUTPUT_DIR}/test.log"
 RAW_DATA_DIR="${OUTPUT_DIR}/raw_data"
 CUDA_VERSION="12.6.1"  # 支持 H100/B200/B300 等最新GPU的稳定CUDA版本
 DCGM_VERSION="3.4.1"
-STRESS_DURATION_SEC=60   # 压力测试时长(秒)，售后服务建议60~300秒
+STRESS_DURATION_SEC=60   # 压力测试(nbody)时长(秒)，售后服务建议60~300秒
+GPUBURN_DURATION_SEC=120 # gpu-burn满载烧机时长(秒/每块GPU)，售后服务建议120~300秒
 FIELD_LEVEL=2            # fieldiag 原厂现场诊断级别: 1=快速(5~15分钟) 2=中等(约4小时) 3=完整(约6小时)
 FORCE_FIELDIAG=false     # 是否强制跳过 fieldiag 预检0~6（确认fieldiag版本+GPU完全匹配时才用）
 TEMP_ALARM_C=90          # 温度报警阈值（℃），超过则自动暂停测试，低于冷却阈值后继续
@@ -88,10 +89,10 @@ interactive_menu() {
         *) echo "    无效选择，保留默认 Level 2"; FIELD_LEVEL=2 ;;
     esac
 
-    # ---- Step 2: 压力测试时长 ----
+    # ---- Step 2: nbody 压力测试时长 ----
     echo ""
-    echo "【2/4】满载压力测试时长（nbody + gpu-burn，售后服务建议 60~300 秒）："
-    echo "    例：60（1分钟）、120（2分钟）、300（5分钟）、600（10分钟）"
+    echo "【2/5】① nbody满载压力时长（第10步：算力+温度压力）："
+    echo "    售后服务建议 60~300 秒；例：60 / 120 / 300 / 600"
     read -rp "    请输入秒数 [默认 ${STRESS_DURATION_SEC}]: " sel
     if [ -n "${sel}" ] && [[ "${sel}" =~ ^[0-9]+$ ]] && [ "${sel}" -gt 0 ]; then
         STRESS_DURATION_SEC="${sel}"
@@ -99,9 +100,20 @@ interactive_menu() {
         [ -n "${sel}" ] && echo "    无效值，保留默认 ${STRESS_DURATION_SEC} 秒"
     fi
 
+    # ---- Step 2.5: gpu-burn 烧机时长 ----
+    echo ""
+    echo "【3/5】② gpu-burn 烧机时长（第13.5步：矩阵乘法正确性+满载烧机，单块GPU耗时）："
+    echo "    售后服务建议 120~300 秒；8卡服务器 x ${GPUBURN_DURATION_SEC}秒 = 总时长"
+    read -rp "    请输入秒数 [默认 ${GPUBURN_DURATION_SEC}]: " sel
+    if [ -n "${sel}" ] && [[ "${sel}" =~ ^[0-9]+$ ]] && [ "${sel}" -gt 0 ]; then
+        GPUBURN_DURATION_SEC="${sel}"
+    else
+        [ -n "${sel}" ] && echo "    无效值，保留默认 ${GPUBURN_DURATION_SEC} 秒"
+    fi
+
     # ---- Step 3: 温度报警阈值 ----
     echo ""
-    echo "【3/4】温度报警阈值（最高温度，超过自动暂停测试；H100/H200/B300建议92，A100建议90，消费级建议85）："
+    echo "【4/5】温度报警阈值（最高温度，超过自动暂停测试；H100/H200/B300建议92，A100建议90，消费级建议85）："
     echo "    例：80 / 85 / 90 / 92 / 95"
     read -rp "    请输入摄氏度 [默认 ${TEMP_ALARM_C}]: " sel
     if [ -n "${sel}" ] && [[ "${sel}" =~ ^[0-9]+$ ]] && [ "${sel}" -ge 50 ] && [ "${sel}" -le 110 ]; then
@@ -114,7 +126,7 @@ interactive_menu() {
     local default_cool=$(( TEMP_ALARM_C - 15 ))
     [ "${default_cool}" -lt 40 ] && default_cool=40
     echo ""
-    echo "【4/4】冷却恢复温度（降到该温度以下自动恢复测试，建议比报警阈值低 10~20℃）："
+    echo "【5/5】冷却恢复温度（降到该温度以下自动恢复测试，建议比报警阈值低 10~20℃）："
     read -rp "    请输入摄氏度 [默认 ${default_cool}]: " sel
     if [ -n "${sel}" ] && [[ "${sel}" =~ ^[0-9]+$ ]]; then
         if [ "${sel}" -lt "${TEMP_ALARM_C}" ]; then
@@ -131,11 +143,12 @@ interactive_menu() {
     echo "╔══════════════════════════════════════════════════════════════╗"
     echo "║  最终配置确认："
     echo "║   · fieldiag 诊断等级 : Level ${FIELD_LEVEL}"
-    echo "║   · 满载压力时长     : ${STRESS_DURATION_SEC} 秒"
+    echo "║   · ① nbody压力时长  : ${STRESS_DURATION_SEC} 秒"
+    echo "║   · ② gpu-burn时长   : ${GPUBURN_DURATION_SEC} 秒 / 每块GPU"
     echo "║   · 温度报警阈值     : ${TEMP_ALARM_C} ℃（超过自动暂停）"
     echo "║   · 冷却恢复温度     : ${TEMP_COOLDOWN_C} ℃（低于后自动继续）"
-    echo "║  运行中手动暂停      : touch ${OUTPUT_DIR}/.manual_pause"
-    echo "║  运行中手动恢复      : rm    -f ${OUTPUT_DIR}/.manual_pause"
+    echo "║  运行中手动暂停      : touch \${OUTPUT_DIR}/.manual_pause"
+    echo "║  运行中手动恢复      : rm    -f \${OUTPUT_DIR}/.manual_pause"
     echo "╚══════════════════════════════════════════════════════════════╝"
     echo ""
 }
@@ -1635,10 +1648,10 @@ test_gpu_burn() {
     # gpu-burn 用法: gpu_burn <seconds> <device_id>
     # 逐GPU烧机（确保每块GPU都被独立校验）
     for (( i=0; i<gpu_count; i++ )); do
-        local burn_time=120  # 每块GPU烧120秒，售后服务建议120~300秒
-        log_info "GPU ${i}: [第三方] gpu-burn 满载烧机 ${burn_time} 秒（含矩阵乘法正确性校验）..."
+        wait_for_ready "gpu-burn烧机 GPU ${i}/${gpu_count}"
+        log_info "GPU ${i}: [第三方] gpu-burn 满载烧机 ${GPUBURN_DURATION_SEC} 秒（含矩阵乘法正确性校验）..."
         CUDA_VISIBLE_DEVICES=${i} save_raw "gpu_burn_gpu${i}" \
-            "${factory_bin}/gpu_burn" "${burn_time}" "${i}"
+            "${factory_bin}/gpu_burn" "${GPUBURN_DURATION_SEC}" "${i}"
     done
 
     # 停止监控
@@ -1699,11 +1712,19 @@ main() {
             --skip-install) skip_install=true ;;
             --stress-only)  stress_only=true  ;;
             --field-level)  shift_next_field_level=true ;;
+            --gpuburn-time)  shift_next_gpuburn=true ;;
             --force-fieldiag) FORCE_FIELDIAG=true ;;
             *)
                 if [ "${shift_next_field_level}" = "true" ]; then
                     FIELD_LEVEL="${arg}"
                     shift_next_field_level=false
+                elif [ "${shift_next_gpuburn}" = "true" ]; then
+                    if [[ "${arg}" =~ ^[0-9]+$ ]] && [ "${arg}" -gt 0 ]; then
+                        GPUBURN_DURATION_SEC="${arg}"
+                    else
+                        echo "[WARN] --gpuburn-time 参数无效，保留默认 ${GPUBURN_DURATION_SEC} 秒" >&2
+                    fi
+                    shift_next_gpuburn=false
                 fi
                 ;;
             -h|--help)
@@ -1720,6 +1741,8 @@ NVIDIA GPU 售后服务自动化测试脚本
                          1 = 快速测试 (约5~15分钟)
                          2 = 中等深度 (约4小时)
                          3 = 完整诊断 (约6小时)
+  --gpuburn-time N     gpu-burn 满载烧机时长，单位：秒（每块GPU单独算）
+                         售后服务推荐：120~300
   --force-fieldiag     【慎用】强制跳过 fieldiag 所有预检（GPU产品线/30秒快速预检/二进制兼容）
                        仅在你100%确认fieldiag版本+GPU完全匹配时才用，否则可能卡死数小时
   -h, --help           显示此帮助
@@ -1748,11 +1771,12 @@ EOF
 
     init
     log_info "输出目录: ${OUTPUT_DIR}"
-    log_info "参数设置: fieldiag等级=Level ${FIELD_LEVEL} | 压力时长=${STRESS_DURATION_SEC}秒 | 温度报警=${TEMP_ALARM_C}℃ | 冷却恢复=${TEMP_COOLDOWN_C}℃"
+    log_info "参数设置: fieldiag等级=Level ${FIELD_LEVEL} | nbody压力=${STRESS_DURATION_SEC}秒 | gpu-burn=${GPUBURN_DURATION_SEC}秒/卡 | 温度报警=${TEMP_ALARM_C}℃ | 冷却恢复=${TEMP_COOLDOWN_C}℃"
     # 写入配置供报告查阅
     {
         echo "fieldiag_level: Level ${FIELD_LEVEL}"
         echo "stress_duration_sec: ${STRESS_DURATION_SEC}"
+        echo "gpuburn_duration_sec: ${GPUBURN_DURATION_SEC}"
         echo "temp_alarm_c: ${TEMP_ALARM_C}"
         echo "temp_cooldown_c: ${TEMP_COOLDOWN_C}"
         echo "force_fieldiag: ${FORCE_FIELDIAG}"
