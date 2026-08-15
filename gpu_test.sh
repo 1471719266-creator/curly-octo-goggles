@@ -299,6 +299,77 @@ install_dcgm() {
 }
 
 # =========================================
+# 4.5 下载编译原厂质检工具：gpu-burn + cuda_memtest
+#   - gpu-burn: 满载烧机+正确性校验（矩阵乘法结果与CPU基准比对）
+#   - cuda_memtest: 显存10种模式主动写入-读出-校验（行业级显存质检标准）
+# =========================================
+install_factory_tools() {
+    log_info "========== 4.5 下载编译原厂质检工具（gpu-burn + cuda_memtest） =========="
+
+    local FACTORY_BIN="${OUTPUT_DIR}/factory_tools_bin"
+    mkdir -p "${FACTORY_BIN}"
+    echo "${FACTORY_BIN}" > "${OUTPUT_DIR}/factory_bin_dir.txt"
+
+    export PATH="/usr/local/cuda/bin:${PATH}"
+    export LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH}"
+
+    # ---- gpu-burn: 满载烧机 + 正确性校验 ----
+    local GB_DIR="/tmp/gpu-burn"
+    if [ ! -x "${GB_DIR}/gpu_burn" ]; then
+        log_info "[1/2] 下载编译 gpu-burn（满载烧机+正确性校验）..."
+        rm -rf "${GB_DIR}"
+        git clone --depth 1 https://github.com/wilicc/gpu-burn.git "${GB_DIR}" >> "${LOG_FILE}" 2>&1
+        if [ $? -ne 0 ]; then
+            log_warn "gpu-burn git clone 失败，尝试备用地址..."
+            git clone --depth 1 https://gitclone.com/github.com/wilicc/gpu-burn.git "${GB_DIR}" >> "${LOG_FILE}" 2>&1 || true
+        fi
+        if [ -d "${GB_DIR}" ]; then
+            # 修改Makefile指定CUDA路径
+            sed -i "s|CUDA_PATH?=.*|CUDA_PATH?=/usr/local/cuda|g" "${GB_DIR}/Makefile" 2>/dev/null || true
+            make -C "${GB_DIR}" >> "${LOG_FILE}" 2>&1
+            if [ -x "${GB_DIR}/gpu_burn" ]; then
+                cp "${GB_DIR}/gpu_burn" "${FACTORY_BIN}/"
+                log_ok "gpu-burn 编译成功"
+            else
+                log_warn "gpu-burn 编译失败，跳过（不影响其他测试）"
+            fi
+        fi
+    else
+        log_ok "gpu-burn 已编译，直接复用"
+        cp "${GB_DIR}/gpu_burn" "${FACTORY_BIN}/" 2>/dev/null || true
+    fi
+
+    # ---- cuda_memtest: 显存10种模式主动校验 ----
+    local CM_DIR="/tmp/cuda_memtest"
+    if [ ! -x "${CM_DIR}/cuda_memtest" ] && [ ! -x "${CM_DIR}/cuda_memtest-1.2.3/cuda_memtest" ]; then
+        log_info "[2/2] 下载编译 cuda_memtest（显存10种模式主动写入-读出-校验）..."
+        rm -rf "${CM_DIR}"
+        git clone --depth 1 https://github.com/ComputationalRadiationPhysics/cuda_memtest.git "${CM_DIR}" >> "${LOG_FILE}" 2>&1
+        if [ $? -ne 0 ]; then
+            log_warn "cuda_memtest git clone 失败，尝试备用地址..."
+            git clone --depth 1 https://gitclone.com/github.com/ComputationalRadiationPhysics/cuda_memtest.git "${CM_DIR}" >> "${LOG_FILE}" 2>&1 || true
+        fi
+        if [ -d "${CM_DIR}" ]; then
+            sed -i "s|CUDA_DIR.*=.*|CUDA_DIR = /usr/local/cuda|g" "${CM_DIR}/Makefile" 2>/dev/null || true
+            make -C "${CM_DIR}" >> "${LOG_FILE}" 2>&1
+            local cm_bin=$(find "${CM_DIR}" -name "cuda_memtest" -type f -executable 2>/dev/null | head -n1)
+            if [ -n "${cm_bin}" ]; then
+                cp "${cm_bin}" "${FACTORY_BIN}/cuda_memtest"
+                log_ok "cuda_memtest 编译成功"
+            else
+                log_warn "cuda_memtest 编译失败，跳过（不影响其他测试）"
+            fi
+        fi
+    else
+        log_ok "cuda_memtest 已编译，直接复用"
+        local cm_bin=$(find "${CM_DIR}" -name "cuda_memtest" -type f -executable 2>/dev/null | head -n1)
+        [ -n "${cm_bin}" ] && cp "${cm_bin}" "${FACTORY_BIN}/cuda_memtest" 2>/dev/null || true
+    fi
+
+    log_ok "原厂质检工具就绪: $(ls -1 "${FACTORY_BIN}" 2>/dev/null | tr '\n' ', ')"
+}
+
+# =========================================
 # 5. GPU 枚举与基础信息采集（门禁检查）
 # =========================================
 enumerate_gpus() {
@@ -679,25 +750,83 @@ test_factory_validation() {
 }
 
 # =========================================
-# 13. 显存测试（memtestG80 / cuda_memtest 思路）
+# 13. 显存主动校验测试（cuda_memtest: 10种模式写入-读出-比对）
+#   这是行业级显存质检标准，覆盖以下测试模式：
+#   Test0: Walking 1s    Test1: Walking 0s   Test2: Random pattern
+#   Test3: Gaussian     Test4: Solid Bits   Test5: Address Fetch
+#   Test6: Block Seq     Test7: Checkerboard Test8: Shift
+#   Test9: Inversions   Test10: Memory
+#   任何模式报错 = 显存硬件故障 → 需RMA
 # =========================================
 test_memory() {
-    log_info "========== 13. 显存读写测试 =========="
-    local bin_dir
-    bin_dir=$(cat "${OUTPUT_DIR}/cuda_bin_dir.txt" 2>/dev/null)
+    log_info "========== 13. 显存主动校验测试（cuda_memtest 10种模式） =========="
+    local factory_bin
+    factory_bin=$(cat "${OUTPUT_DIR}/factory_bin_dir.txt" 2>/dev/null)
+    local cuda_bin
+    cuda_bin=$(cat "${OUTPUT_DIR}/cuda_bin_dir.txt" 2>/dev/null)
     local gpu_count
     gpu_count=$(cat "${OUTPUT_DIR}/gpu_count.txt")
 
-    # bandwidthTest 中的 device to device 实际也是显存测试的一部分
+    local has_memtest=false
+    if [ -x "${factory_bin}/cuda_memtest" ]; then
+        has_memtest=true
+    fi
+
     for (( i=0; i<gpu_count; i++ )); do
-        if [ -x "${bin_dir}/bandwidthTest" ]; then
-            log_info "GPU ${i}: 显存子系统测试（shmoo模式）..."
+        if [ "${has_memtest}" = "true" ]; then
+            log_info "GPU ${i}: 运行 cuda_memtest 10种模式显存校验（可能需要数分钟）..."
+            CUDA_VISIBLE_DEVICES=${i} save_raw "cuda_memtest_gpu${i}" \
+                "${factory_bin}/cuda_memtest" --disable_gpu_lock
+        elif [ -x "${cuda_bin}/bandwidthTest" ]; then
+            # 回退：bandwidthTest shmoo 模式（仅测带宽，不测正确性）
+            log_warn "GPU ${i}: cuda_memtest 不可用，回退到 bandwidthTest shmoo（仅带宽测试，无正确性校验）"
             CUDA_VISIBLE_DEVICES=${i} save_raw "memtest_shmoo_gpu${i}" \
-                "${bin_dir}/bandwidthTest" --device=${i} --memory=device --mode=shmoo
+                "${cuda_bin}/bandwidthTest" --device=${i} --memory=device --mode=shmoo
+        else
+            log_warn "GPU ${i}: 无可用显存测试工具，跳过"
         fi
     done
 
-    log_ok "显存测试完成"
+    log_ok "显存主动校验测试完成"
+}
+
+# =========================================
+# 13.5 满载烧机+正确性校验（gpu-burn: 矩阵乘法结果比对）
+#   gpu-burn 对每块GPU持续运行大矩阵乘法，
+#   计算结果与CPU参考值逐元素比对，任何不匹配=计算单元故障
+#   这与dcgmi diag -r 3中的Targeted Stress互补，是出厂质检必跑项
+# =========================================
+test_gpu_burn() {
+    log_info "========== 13.5 满载烧机+正确性校验（gpu-burn） =========="
+    local factory_bin
+    factory_bin=$(cat "${OUTPUT_DIR}/factory_bin_dir.txt" 2>/dev/null)
+    local gpu_count
+    gpu_count=$(cat "${OUTPUT_DIR}/gpu_count.txt")
+
+    if [ ! -x "${factory_bin}/gpu_burn" ]; then
+        log_warn "gpu_burn 不可用，跳过正确性烧机测试"
+        return
+    fi
+
+    # 启动后台温度/功耗监控
+    log_info "启动 nvidia-smi 后台监控（gpu-burn 烧机期间）..."
+    nvidia-smi --query-gpu=timestamp,index,name,temperature.gpu,power.draw,fan.speed,utilization.gpu,memory.used,memory.total \
+        --format=csv -l 2 -f "${RAW_DATA_DIR}/gpu_monitor_burn.csv" &
+    local monitor_pid=$!
+
+    # gpu-burn 用法: gpu_burn <seconds> <device_id>
+    # 逐GPU烧机（确保每块GPU都被独立校验）
+    for (( i=0; i<gpu_count; i++ )); do
+        local burn_time=120  # 每块GPU烧120秒，售后服务建议120~300秒
+        log_info "GPU ${i}: gpu-burn 满载烧机 ${burn_time} 秒（含矩阵乘法正确性校验）..."
+        CUDA_VISIBLE_DEVICES=${i} save_raw "gpu_burn_gpu${i}" \
+            "${factory_bin}/gpu_burn" "${burn_time}" "${i}"
+    done
+
+    # 停止监控
+    kill "${monitor_pid}" 2>/dev/null; wait "${monitor_pid}" 2>/dev/null
+
+    log_ok "满载烧机+正确性校验完成"
 }
 
 # =========================================
@@ -796,6 +925,7 @@ EOF
         check_nvidia_driver
         install_cuda_toolkit
         install_dcgm
+        install_factory_tools   # 4.5 下载编译 gpu-burn + cuda_memtest
     else
         install_system_deps
         check_system
@@ -806,6 +936,7 @@ EOF
         if command -v nvcc &>/dev/null; then
             compile_cuda_samples
         fi
+        install_factory_tools
     fi
 
     # ============== 测试阶段 ==============
@@ -814,7 +945,8 @@ EOF
     test_device_query         # 6. deviceQuery
     test_ecc                  # 12. ECC
     test_factory_validation   # 12.5 原厂现场质检（Field Validation）
-    test_memory               # 13. 显存
+    test_memory               # 13. 显存主动校验（cuda_memtest 10种模式）
+    test_gpu_burn             # 13.5 满载烧机+正确性校验（gpu-burn）
     test_bandwidth            # 7. PCIe带宽
     test_p2p                  # 8. P2P
     test_cuda_perf            # 9. 计算性能

@@ -405,6 +405,94 @@ def parse_ecc_csv(ecc_path: Path) -> List[Dict[str, str]]:
     return parse_csv_like(safe_read(ecc_path))
 
 
+def parse_cuda_memtest(path: Path) -> Dict[str, Any]:
+    """解析 cuda_memtest 输出
+    10种模式：Walking 1s/0s, Random, Gaussian, Solid Bits, Address Fetch,
+    Block Seq, Checkerboard, Shift, Inversions, Memory
+    任何报错=显存硬件故障→需RMA
+    """
+    text = safe_read(path)
+    result: Dict[str, Any] = {
+        "raw": text[:5000],
+        "passed": False,
+        "error_count": 0,
+        "errors": [],
+        "tests_run": [],
+    }
+    if not text.strip():
+        return result
+
+    # 检测 "Err" 或 "error" 或 "FAIL" 等关键字
+    error_lines = []
+    test_pattern = re.compile(r"(Test\d+|test\d+)\s*[:|]?\s*(.*)", re.IGNORECASE)
+    for line in text.splitlines():
+        low = line.lower()
+        # 记录跑过的测试
+        m = test_pattern.search(line)
+        if m:
+            result["tests_run"].append(m.group(1))
+        # 检测错误
+        if any(kw in low for kw in ["err", "fail", "mismatch", "incorrect", "fault"]):
+            if "0 error" not in low and "no error" not in low:
+                error_lines.append(line.strip())
+                result["error_count"] += 1
+
+    result["errors"] = error_lines[:20]
+
+    # 检测最终通过状态
+    if "no errors" in text.lower() or "passed" in text.lower():
+        result["passed"] = True
+    elif result["error_count"] == 0 and result["tests_run"]:
+        result["passed"] = True
+
+    return result
+
+
+def parse_gpu_burn(path: Path) -> Dict[str, Any]:
+    """解析 gpu-burn 输出
+    gpu-burn 做矩阵乘法并将GPU结果与CPU参考值比对，
+    任何不匹配=计算单元故障→需RMA
+    """
+    text = safe_read(path)
+    result: Dict[str, Any] = {
+        "raw": text[:5000],
+        "passed": False,
+        "errors": [],
+        "gpus_tested": 0,
+        "summary": "",
+    }
+    if not text.strip():
+        return result
+
+    error_lines = []
+    for line in text.splitlines():
+        low = line.lower()
+        if any(kw in low for kw in ["fail", "mismatch", "error", "not ok"]):
+            if "no error" not in low:
+                error_lines.append(line.strip())
+
+    result["errors"] = error_lines[:20]
+
+    # 统计测试的GPU数
+    result["gpus_tested"] = len(re.findall(r"GPU\s*\d+|device\s*\d+", text, re.IGNORECASE))
+
+    # 最终状态
+    if "ok" in text.lower() and not error_lines:
+        result["passed"] = True
+    elif "fail" in text.lower() and not error_lines:
+        result["passed"] = False
+    elif not error_lines and result["gpus_tested"] > 0:
+        result["passed"] = True
+
+    # 提取摘要行
+    for line in text.splitlines():
+        if "test" in line.lower() and ("summary" in line.lower() or "complete" in line.lower() or "finish" in line.lower()):
+            result["summary"] = line.strip()
+            break
+
+    return result
+
+
 def parse_dmesg_xid(xid_path: Path) -> List[str]:
     text = safe_read(xid_path)
     if not text.strip():
@@ -650,6 +738,25 @@ def determine_pass_fail(data: Dict[str, Any]) -> Tuple[bool, List[str]]:
         if nvlink.get("has_errors"):
             issues.append(f"{label} NVLink检测到错误计数 — 检查互联链路完整性")
 
+        # --- 原厂质检：cuda_memtest 显存主动校验 ---
+        memtest = data.get("cuda_memtest", {}).get(str(idx), {})
+        if memtest:
+            if not memtest.get("passed", True):
+                err_count = memtest.get("error_count", 0)
+                errors = memtest.get("errors", [])
+                issues.append(f"{label} cuda_memtest 显存校验失败：{err_count}个错误（显存硬件故障，【立即RMA】）")
+                for e in errors[:5]:
+                    issues.append(f"{label}   └ {e}")
+
+        # --- 原厂质检：gpu-burn 满载烧机正确性校验 ---
+        burn = data.get("gpu_burn", {}).get(str(idx), {})
+        if burn:
+            if not burn.get("passed", True):
+                errors = burn.get("errors", [])
+                issues.append(f"{label} gpu-burn 正确性校验失败：矩阵乘法结果与CPU基准不匹配（计算单元故障，【立即RMA】）")
+                for e in errors[:5]:
+                    issues.append(f"{label}   └ {e}")
+
     return (len(issues) == 0), issues
 
 
@@ -707,11 +814,21 @@ def build_data(output_dir: Path, raw_dir: Path, log_file: Path) -> Dict[str, Any
         bw = parse_bandwidth_test(raw_dir / f"bandwidthTest_gpu{i}.txt")
         data["bandwidth"][str(i)] = bw
 
-    # 显存 shmoo
+    # 显存 shmoo（bandwidthTest 回退模式）
     data["memory_test"] = {}
     for i in range(gpu_count):
         mem = parse_bandwidth_test(raw_dir / f"memtest_shmoo_gpu{i}.txt")
         data["memory_test"][str(i)] = mem
+
+    # cuda_memtest 显存10种模式主动校验（原厂质检）
+    data["cuda_memtest"] = {}
+    for i in range(gpu_count):
+        data["cuda_memtest"][str(i)] = parse_cuda_memtest(raw_dir / f"cuda_memtest_gpu{i}.txt")
+
+    # gpu-burn 满载烧机正确性校验（原厂质检）
+    data["gpu_burn"] = {}
+    for i in range(gpu_count):
+        data["gpu_burn"][str(i)] = parse_gpu_burn(raw_dir / f"gpu_burn_gpu{i}.txt")
 
     # P2P
     data["p2p"] = parse_p2p_test(raw_dir / "p2pBandwidthLatencyTest.txt")
@@ -1029,6 +1146,37 @@ summary{{cursor:pointer;color:#1565c0;font-weight:bold;padding:4px;}}
 <details class="raw-section">
 <summary>压力测试CSV原始数据 (逐秒)</summary>
 <pre>{safe_read(raw_dir_global / 'gpu_monitor_during_stress.csv', 100) if raw_dir_global else ''}</pre>
+</details>
+
+<h2>七.5、显存主动校验（cuda_memtest: 10种模式写入-读出-比对）</h2>
+<p class="small">行业级显存质检标准，覆盖 Walking 1s/0s、Random、Gaussian、Solid Bits、Address Fetch、Block Seq、Checkerboard、Shift、Inversions、Memory 共10种测试模式。任何模式报错=显存硬件故障→需RMA</p>
+{
+    (lambda mt: html_table_from_dicts([
+        {"GPU": idx, "通过": ('<span style="color:#2e7d32;font-weight:bold;">PASS</span>' if d.get("passed") else '<span style="color:#c62828;font-weight:bold;">FAIL</span>'),
+         "错误数": d.get("error_count", "—"),
+         "已跑测试": ", ".join(d.get("tests_run", [])[:10]) or "—"}
+        for idx, d in sorted(mt.items())
+    ]) if mt else "<p><em>cuda_memtest 不可用或未运行</em></p>")(data.get("cuda_memtest",{}))
+}
+<details class="raw-section">
+<summary>cuda_memtest 各GPU原始输出</summary>
+{''.join(f'<pre style="margin-top:8px;">=== GPU {idx} ===\n{d.get("raw","")[:2000]}\n</pre>' for idx, d in sorted(data.get("cuda_memtest",{}).items()))}
+</details>
+
+<h2>七.6、满载烧机+正确性校验（gpu-burn: 矩阵乘法结果比对）</h2>
+<p class="small">gpu-burn 对每块GPU持续运行大矩阵乘法，计算结果与CPU参考值逐元素比对。任何不匹配=计算单元故障→需RMA。与dcgmi diag -r 3中的Targeted Stress互补，是出厂质检必跑项</p>
+{
+    (lambda gb: html_table_from_dicts([
+        {"GPU": idx,
+         "通过": ('<span style="color:#2e7d32;font-weight:bold;">PASS</span>' if d.get("passed") else '<span style="color:#c62828;font-weight:bold;">FAIL</span>'),
+         "错误数": len(d.get("errors",[])),
+         "摘要": d.get("summary","") or "—"}
+        for idx, d in sorted(gb.items())
+    ]) if gb else "<p><em>gpu-burn 不可用或未运行</em></p>")(data.get("gpu_burn",{}))
+}
+<details class="raw-section">
+<summary>gpu-burn 各GPU原始输出</summary>
+{''.join(f'<pre style="margin-top:8px;">=== GPU {idx} ===\n{d.get("raw","")[:2000]}\n</pre>' for idx, d in sorted(data.get("gpu_burn",{}).items()))}
 </details>
 
 <h2>八、NVIDIA DCGM 官方数据中心级诊断</h2>
