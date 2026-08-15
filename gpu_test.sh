@@ -63,6 +63,7 @@ install_system_deps() {
     command -v python3 &>/dev/null || deps_missing+=("python3")
     command -v make    &>/dev/null || deps_missing+=("make")
     command -v gcc     &>/dev/null || deps_missing+=("gcc")
+    command -v unzip   &>/dev/null || deps_missing+=("unzip")
 
     if [ ${#deps_missing[@]} -gt 0 ]; then
         log_info "缺少依赖: ${deps_missing[*]}，正在安装..."
@@ -302,6 +303,7 @@ install_dcgm() {
 # 4.5 下载编译原厂质检工具：gpu-burn + cuda_memtest
 #   - gpu-burn: 满载烧机+正确性校验（矩阵乘法结果与CPU基准比对）
 #   - cuda_memtest: 显存10种模式主动写入-读出-校验（行业级显存质检标准）
+#   下载策略：git clone → wget zip → curl zip → ghproxy镜像（4层回退）
 # =========================================
 install_factory_tools() {
     log_info "========== 4.5 下载编译原厂质检工具（gpu-burn + cuda_memtest） =========="
@@ -313,60 +315,217 @@ install_factory_tools() {
     export PATH="/usr/local/cuda/bin:${PATH}"
     export LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH}"
 
-    # ---- gpu-burn: 满载烧机 + 正确性校验 ----
+    # ================================================================
+    # 工具1: gpu-burn（满载烧机+正确性校验）
+    # ================================================================
     local GB_DIR="/tmp/gpu-burn"
-    if [ ! -x "${GB_DIR}/gpu_burn" ]; then
-        log_info "[1/2] 下载编译 gpu-burn（满载烧机+正确性校验）..."
-        rm -rf "${GB_DIR}"
-        git clone --depth 1 https://github.com/wilicc/gpu-burn.git "${GB_DIR}" >> "${LOG_FILE}" 2>&1
-        if [ $? -ne 0 ]; then
-            log_warn "gpu-burn git clone 失败，尝试备用地址..."
-            git clone --depth 1 https://gitclone.com/github.com/wilicc/gpu-burn.git "${GB_DIR}" >> "${LOG_FILE}" 2>&1 || true
-        fi
-        if [ -d "${GB_DIR}" ]; then
-            # 修改Makefile指定CUDA路径
-            sed -i "s|CUDA_PATH?=.*|CUDA_PATH?=/usr/local/cuda|g" "${GB_DIR}/Makefile" 2>/dev/null || true
-            make -C "${GB_DIR}" >> "${LOG_FILE}" 2>&1
-            if [ -x "${GB_DIR}/gpu_burn" ]; then
-                cp "${GB_DIR}/gpu_burn" "${FACTORY_BIN}/"
-                log_ok "gpu-burn 编译成功"
-            else
-                log_warn "gpu-burn 编译失败，跳过（不影响其他测试）"
-            fi
-        fi
-    else
-        log_ok "gpu-burn 已编译，直接复用"
-        cp "${GB_DIR}/gpu_burn" "${FACTORY_BIN}/" 2>/dev/null || true
+    local gb_ok=false
+
+    # 检查是否已编译好
+    if [ -x "${GB_DIR}/gpu_burn" ]; then
+        cp "${GB_DIR}/gpu_burn" "${FACTORY_BIN}/" 2>/dev/null
+        log_ok "gpu-burn 已存在，直接复用"
+        gb_ok=true
     fi
 
-    # ---- cuda_memtest: 显存10种模式主动校验 ----
-    local CM_DIR="/tmp/cuda_memtest"
-    if [ ! -x "${CM_DIR}/cuda_memtest" ] && [ ! -x "${CM_DIR}/cuda_memtest-1.2.3/cuda_memtest" ]; then
-        log_info "[2/2] 下载编译 cuda_memtest（显存10种模式主动写入-读出-校验）..."
-        rm -rf "${CM_DIR}"
-        git clone --depth 1 https://github.com/ComputationalRadiationPhysics/cuda_memtest.git "${CM_DIR}" >> "${LOG_FILE}" 2>&1
-        if [ $? -ne 0 ]; then
-            log_warn "cuda_memtest git clone 失败，尝试备用地址..."
-            git clone --depth 1 https://gitclone.com/github.com/ComputationalRadiationPhysics/cuda_memtest.git "${CM_DIR}" >> "${LOG_FILE}" 2>&1 || true
+    if [ "${gb_ok}" = "false" ]; then
+        log_info "[1/2] 下载 gpu-burn ..."
+        rm -rf "${GB_DIR}"
+        mkdir -p "${GB_DIR}"
+
+        # 下载方法1: git clone（官方仓库）
+        log_info "  尝试方法1: git clone (github.com)..."
+        git clone --depth 1 https://github.com/wilicc/gpu-burn.git "${GB_DIR}" >> "${LOG_FILE}" 2>&1
+        local git_ret=$?
+
+        # 下载方法2: git clone via ghproxy镜像
+        if [ ${git_ret} -ne 0 ] || [ ! -f "${GB_DIR}/Makefile" ]; then
+            log_warn "  git clone 失败(ret=${git_ret})，尝试方法2: ghproxy镜像..."
+            rm -rf "${GB_DIR}"
+            git clone --depth 1 https://ghproxy.com/https://github.com/wilicc/gpu-burn.git "${GB_DIR}" >> "${LOG_FILE}" 2>&1
+            git_ret=$?
         fi
-        if [ -d "${CM_DIR}" ]; then
-            sed -i "s|CUDA_DIR.*=.*|CUDA_DIR = /usr/local/cuda|g" "${CM_DIR}/Makefile" 2>/dev/null || true
-            make -C "${CM_DIR}" >> "${LOG_FILE}" 2>&1
-            local cm_bin=$(find "${CM_DIR}" -name "cuda_memtest" -type f -executable 2>/dev/null | head -n1)
+
+        # 下载方法3: wget 下载zip压缩包
+        if [ ${git_ret} -ne 0 ] || [ ! -f "${GB_DIR}/Makefile" ]; then
+            log_warn "  git clone 失败(ret=${git_ret})，尝试方法3: wget zip..."
+            rm -rf "${GB_DIR}"
+            local gb_zip="/tmp/gpu-burn.zip"
+            wget -q --timeout=60 -O "${gb_zip}" \
+                "https://github.com/wilicc/gpu-burn/archive/refs/heads/master.zip" >> "${LOG_FILE}" 2>&1
+            if [ $? -eq 0 ] && [ -f "${gb_zip}" ] && [ -s "${gb_zip}" ]; then
+                unzip -q -o "${gb_zip}" -d /tmp/ >> "${LOG_FILE}" 2>&1
+                mv /tmp/gpu-burn-master "${GB_DIR}" 2>/dev/null || true
+            else
+                log_warn "  wget zip 失败，尝试方法4: curl via ghproxy..."
+                curl -sL --max-time 60 -o "${gb_zip}" \
+                    "https://ghproxy.com/https://github.com/wilicc/gpu-burn/archive/refs/heads/master.zip" >> "${LOG_FILE}" 2>&1
+                if [ -f "${gb_zip}" ] && [ -s "${gb_zip}" ]; then
+                    unzip -q -o "${gb_zip}" -d /tmp/ >> "${LOG_FILE}" 2>&1
+                    mv /tmp/gpu-burn-master "${GB_DIR}" 2>/dev/null || true
+                fi
+            fi
+        fi
+
+        # 检查源码是否下载成功
+        if [ ! -f "${GB_DIR}/Makefile" ]; then
+            log_error "  gpu-burn 源码下载失败（所有4种方法均失败）"
+            log_error "  请手动下载: https://github.com/wilicc/gpu-burn"
+            log_error "  解压后执行: cd gpu-burn && make CUDA_PATH=/usr/local/cuda"
+            log_error "  然后将 gpu_burn 复制到: ${FACTORY_BIN}/"
+        else
+            log_ok "  gpu-burn 源码下载成功"
+
+            # 修改Makefile指定CUDA路径
+            if grep -q "CUDA_PATH" "${GB_DIR}/Makefile" 2>/dev/null; then
+                sed -i "s|CUDA_PATH?=.*|CUDA_PATH?=/usr/local/cuda|g" "${GB_DIR}/Makefile"
+            else
+                # 某些版本没有CUDA_PATH变量，直接在编译命令里加
+                sed -i "s|nvcc|/usr/local/cuda/bin/nvcc|g" "${GB_DIR}/Makefile" 2>/dev/null || true
+                sed -i "s|-L.*cuda|/usr/local/cuda/lib64|g" "${GB_DIR}/Makefile" 2>/dev/null || true
+            fi
+            # 修复：某些版本用compute.cu需要指定arch
+            export CUDA_PATH="/usr/local/cuda"
+
+            log_info "  开始编译 gpu-burn..."
+            make -C "${GB_DIR}" CUDA_PATH=/usr/local/cuda >> "${LOG_FILE}" 2>&1
+            local make_ret=$?
+
+            if [ ${make_ret} -eq 0 ] && [ -x "${GB_DIR}/gpu_burn" ]; then
+                cp "${GB_DIR}/gpu_burn" "${FACTORY_BIN}/"
+                # 验证二进制能否运行
+                if "${FACTORY_BIN}/gpu_burn" -h &>/dev/null || "${FACTORY_BIN}/gpu_burn" --help &>/dev/null; then
+                    log_ok "  gpu-burn 编译成功并验证通过"
+                    gb_ok=true
+                else
+                    log_warn "  gpu-burn 编译成功但运行验证失败（可能CUDA运行库路径问题）"
+                    log_warn "  尝试设置LD_LIBRARY_PATH后重新验证..."
+                    LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH}" "${FACTORY_BIN}/gpu_burn" -h &>/dev/null && {
+                        log_ok "  gpu-burn 运行验证通过（需设置LD_LIBRARY_PATH）"
+                        gb_ok=true
+                    } || {
+                        log_warn "  gpu-burn 运行验证仍失败，但二进制已保留，将在测试时尝试运行"
+                        gb_ok=true  # 保留二进制，运行时再验证
+                    }
+                fi
+            else
+                log_error "  gpu-burn 编译失败(ret=${make_ret})"
+                log_error "  编译错误日志（最后30行）:"
+                tail -30 "${LOG_FILE}" 2>/dev/null | while read -r line; do log_error "    ${line}"; done
+                log_error "  请检查: 1) nvcc是否安装 2) CUDA头文件路径 3) 依赖库"
+            fi
+        fi
+    fi
+
+    # ================================================================
+    # 工具2: cuda_memtest（显存10种模式主动校验）
+    # ================================================================
+    local CM_DIR="/tmp/cuda_memtest"
+    local cm_ok=false
+
+    # 检查是否已编译好
+    local existing_cm=$(find "${CM_DIR}" -name "cuda_memtest" -type f -executable 2>/dev/null | head -n1)
+    if [ -n "${existing_cm}" ]; then
+        cp "${existing_cm}" "${FACTORY_BIN}/cuda_memtest" 2>/dev/null
+        log_ok "cuda_memtest 已存在，直接复用"
+        cm_ok=true
+    fi
+
+    if [ "${cm_ok}" = "false" ]; then
+        log_info "[2/2] 下载 cuda_memtest ..."
+        rm -rf "${CM_DIR}"
+        mkdir -p "${CM_DIR}"
+
+        # 下载方法1: git clone（官方仓库）
+        log_info "  尝试方法1: git clone (github.com)..."
+        git clone --depth 1 https://github.com/ComputationalRadiationPhysics/cuda_memtest.git "${CM_DIR}" >> "${LOG_FILE}" 2>&1
+        local git_ret=$?
+
+        # 下载方法2: git clone via ghproxy镜像
+        if [ ${git_ret} -ne 0 ] || [ ! -f "${CM_DIR}/Makefile" ]; then
+            log_warn "  git clone 失败(ret=${git_ret})，尝试方法2: ghproxy镜像..."
+            rm -rf "${CM_DIR}"
+            git clone --depth 1 https://ghproxy.com/https://github.com/ComputationalRadiationPhysics/cuda_memtest.git "${CM_DIR}" >> "${LOG_FILE}" 2>&1
+            git_ret=$?
+        fi
+
+        # 下载方法3: wget 下载zip压缩包
+        if [ ${git_ret} -ne 0 ] || [ ! -f "${CM_DIR}/Makefile" ]; then
+            log_warn "  git clone 失败(ret=${git_ret})，尝试方法3: wget zip..."
+            rm -rf "${CM_DIR}"
+            local cm_zip="/tmp/cuda_memtest.zip"
+            wget -q --timeout=60 -O "${cm_zip}" \
+                "https://github.com/ComputationalRadiationPhysics/cuda_memtest/archive/refs/heads/master.zip" >> "${LOG_FILE}" 2>&1
+            if [ $? -eq 0 ] && [ -f "${cm_zip}" ] && [ -s "${cm_zip}" ]; then
+                unzip -q -o "${cm_zip}" -d /tmp/ >> "${LOG_FILE}" 2>&1
+                mv /tmp/cuda_memtest-master "${CM_DIR}" 2>/dev/null || true
+            else
+                log_warn "  wget zip 失败，尝试方法4: curl via ghproxy..."
+                curl -sL --max-time 60 -o "${cm_zip}" \
+                    "https://ghproxy.com/https://github.com/ComputationalRadiationPhysics/cuda_memtest/archive/refs/heads/master.zip" >> "${LOG_FILE}" 2>&1
+                if [ -f "${cm_zip}" ] && [ -s "${cm_zip}" ]; then
+                    unzip -q -o "${cm_zip}" -d /tmp/ >> "${LOG_FILE}" 2>&1
+                    mv /tmp/cuda_memtest-master "${CM_DIR}" 2>/dev/null || true
+                fi
+            fi
+        fi
+
+        # 检查源码是否下载成功
+        if [ ! -f "${CM_DIR}/Makefile" ]; then
+            log_error "  cuda_memtest 源码下载失败（所有4种方法均失败）"
+            log_error "  请手动下载: https://github.com/ComputationalRadiationPhysics/cuda_memtest"
+            log_error "  解压后执行: cd cuda_memtest && make CUDA_DIR=/usr/local/cuda"
+            log_error "  然后将 cuda_memtest 复制到: ${FACTORY_BIN}/"
+        else
+            log_ok "  cuda_memtest 源码下载成功"
+
+            # 修改Makefile指定CUDA路径
+            if grep -q "CUDA_DIR" "${CM_DIR}/Makefile" 2>/dev/null; then
+                sed -i "s|CUDA_DIR.*=.*|CUDA_DIR = /usr/local/cuda|g" "${CM_DIR}/Makefile"
+            fi
+            # 修复nvcc路径
+            sed -i "s|/usr/bin/nvcc|/usr/local/cuda/bin/nvcc|g" "${CM_DIR}/Makefile" 2>/dev/null || true
+
+            log_info "  开始编译 cuda_memtest..."
+            make -C "${CM_DIR}" CUDA_DIR=/usr/local/cuda >> "${LOG_FILE}" 2>&1
+            local make_ret=$?
+
+            local cm_bin=""
+            if [ ${make_ret} -eq 0 ]; then
+                cm_bin=$(find "${CM_DIR}" -name "cuda_memtest" -type f -executable 2>/dev/null | head -n1)
+            fi
+
             if [ -n "${cm_bin}" ]; then
                 cp "${cm_bin}" "${FACTORY_BIN}/cuda_memtest"
-                log_ok "cuda_memtest 编译成功"
+                # 验证二进制能否运行
+                if "${FACTORY_BIN}/cuda_memtest" --help &>/dev/null || "${FACTORY_BIN}/cuda_memtest" 2>&1 | head -5 | grep -qi "usage\|test\|memtest"; then
+                    log_ok "  cuda_memtest 编译成功并验证通过"
+                    cm_ok=true
+                else
+                    log_warn "  cuda_memtest 编译成功但运行验证失败，但二进制已保留"
+                    cm_ok=true
+                fi
             else
-                log_warn "cuda_memtest 编译失败，跳过（不影响其他测试）"
+                log_error "  cuda_memtest 编译失败(ret=${make_ret})"
+                log_error "  编译错误日志（最后30行）:"
+                tail -30 "${LOG_FILE}" 2>/dev/null | while read -r line; do log_error "    ${line}"; done
+                log_error "  请检查: 1) nvcc是否安装 2) CUDA头文件路径 3) 依赖库"
             fi
         fi
-    else
-        log_ok "cuda_memtest 已编译，直接复用"
-        local cm_bin=$(find "${CM_DIR}" -name "cuda_memtest" -type f -executable 2>/dev/null | head -n1)
-        [ -n "${cm_bin}" ] && cp "${cm_bin}" "${FACTORY_BIN}/cuda_memtest" 2>/dev/null || true
     fi
 
-    log_ok "原厂质检工具就绪: $(ls -1 "${FACTORY_BIN}" 2>/dev/null | tr '\n' ', ')"
+    # 最终检查
+    log_info "原厂质检工具就绪状态:"
+    if [ -x "${FACTORY_BIN}/gpu_burn" ]; then
+        log_ok "  gpu_burn: ✓ 可用"
+    else
+        log_warn "  gpu_burn: ✗ 不可用（满载烧机正确性校验将跳过）"
+    fi
+    if [ -x "${FACTORY_BIN}/cuda_memtest" ]; then
+        log_ok "  cuda_memtest: ✓ 可用"
+    else
+        log_warn "  cuda_memtest: ✗ 不可用（显存10种模式校验将回退到bandwidthTest）"
+    fi
 }
 
 # =========================================
