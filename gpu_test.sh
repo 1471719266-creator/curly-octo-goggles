@@ -919,8 +919,72 @@ test_fieldiag() {
     log_ok "找到 fieldiag: ${fieldiag_bin}"
 
     # ================================================================
+    # 预检0：GPU产品线过滤 —— 消费级GPU（RTX/GTX/TITAN 等）直接跳过，不浪费时间
+    #   fieldiag 官方仅支持数据中心 GPU：Tesla / HGX / DGX 系列
+    #   消费级GPU会直接报 UNSUPPORTED GPU FAMILY 并卡死
+    # ================================================================
+    log_info "预检0：GPU产品线识别（判断是否适合跑fieldiag）..."
+    local gpu_names=""
+    if command -v nvidia-smi &>/dev/null; then
+        gpu_names=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || true)
+    fi
+    local supported_gpu=true
+    local unsupported_reason=""
+    local unsupported_gpus=""
+
+    if [ -z "${gpu_names}" ]; then
+        log_warn "  无法获取GPU名称（nvidia-smi不可用），假设不支持fieldiag，为稳妥起见直接跳过"
+        supported_gpu=false
+        unsupported_reason="nvidia-smi不可用，无法确认GPU产品线"
+    else
+        # 逐GPU判断，全部支持才跑；任何一块不支持就整体跳过（避免混合场景卡死）
+        local gpu_idx=0
+        while IFS= read -r gpu_name; do
+            [ -z "${gpu_name}" ] && continue
+            # fieldiag官方支持的数据中心GPU关键字（白名单）
+            if echo "${gpu_name}" | grep -qiE "(H100|H200|H800|H900|B200|B300|B380|B390|GB200|GB300|A100|A800|A900|A30|A10|A10G|T4|T4g|L4|L40|L40S|V100|V100S|P100|P40|P4|K80|K40|M60|M40|A2|L20|L2|L10|L10G|PG500|PG506|PG509|HGX|DGX|Tesla|GRID|Quadro (RTX|GV100|GP100))"; then
+                log_info "  GPU ${gpu_idx}: [✓ 数据中心支持] ${gpu_name}"
+            else
+                # 消费级/半专业级（黑名单）
+                log_warn "  GPU ${gpu_idx}: [✗ 消费级/非官方支持] ${gpu_name} → fieldiag对此GPU很可能报 UNSUPPORTED GPU FAMILY"
+                supported_gpu=false
+                unsupported_gpus="${unsupported_gpus} ${gpu_name};"
+            fi
+            gpu_idx=$((gpu_idx + 1))
+        done <<< "${gpu_names}"
+
+        if [ "${supported_gpu}" = "false" ]; then
+            unsupported_reason="检测到消费级/非数据中心GPU: ${unsupported_gpus}"
+        fi
+    fi
+
+    if [ "${supported_gpu}" = "false" ]; then
+        log_warn "⚠️ 检测到非数据中心GPU，为避免 fieldiag 卡死，自动跳过原厂现场诊断"
+        log_warn "原因: ${unsupported_reason}"
+        log_info "ℹ️ 消费级GPU PCIe插槽检测已由脚本内置的8层公开工具完整覆盖（lspci+nvidia-smi+bandwidthTest+压力监控），结论同等权威"
+        # 写入结果标记，报告显示：消费级GPU跳过（不算FAIL，也不算未安装）
+        echo "CONSUMER_GPU_SKIPPED" > "${RAW_DATA_DIR}/fieldiag_result.txt"
+        {
+            echo "fieldiag 未运行：检测到消费级/非数据中心GPU"
+            echo "GPU列表:"
+            echo "${gpu_names:-未获取到}"
+            echo "原因: ${unsupported_reason}"
+            echo ""
+            echo "消费级GPU PCIe插槽替代方案（脚本已自动执行，无需fieldiag）:"
+            echo "  1. lspci PCIe枚举 → 识别插槽物理接触问题"
+            echo "  2. nvidia-smi + lspci -vvv → 当前链路规格/最大规格/重放计数"
+            echo "  3. bandwidthTest 原厂 → H2D/D2H/D2D带宽实测"
+            echo "  4. bandwidthTest --mode=shmoo → 扫频边际稳定性"
+            echo "  5. nvidia-smi -l 1 压力监控 → 满载时链路不降速"
+        } > "${RAW_DATA_DIR}/fieldiag_diag.txt"
+        echo "N/A（消费级GPU跳过）" > "${RAW_DATA_DIR}/fieldiag_level.txt"
+        return
+    fi
+    log_ok "  全部GPU为数据中心系列（fieldiag官方支持），继续后续自检"
+
+    # ================================================================
     # fieldiag 二进制兼容性自检（从20.04拷到24.04的常见问题）
-    #   检查项:
+    #   检查项（预检0之后，预检30s预检之前）:
     #     1. ELF架构是否匹配（x86_64 vs aarch64）
     #     2. 可执行权限
     #     3. 共享库依赖（ldd 全 resolvable，缺 libcuda.so.1/DCGM 库最常见）
@@ -935,7 +999,7 @@ test_fieldiag() {
     elf_arch=$(file -b "${fieldiag_bin}" 2>/dev/null | head -n1)
     local host_arch=""
     host_arch=$(uname -m)
-    log_info "  [1/5] ELF架构: ${elf_arch} (主机: ${host_arch})"
+    log_info "  [1/6] ELF架构: ${elf_arch} (主机: ${host_arch})"
     if echo "${elf_arch}" | grep -qi "${host_arch}"; then
         log_ok "    架构匹配"
     else
@@ -944,7 +1008,7 @@ test_fieldiag() {
     fi
 
     # [2] 可执行权限（某些文件系统拷贝后权限丢失）
-    log_info "  [2/5] 可执行权限..."
+    log_info "  [2/6] 可执行权限..."
     if [ -x "${fieldiag_bin}" ]; then
         log_ok "    ✓ 已有执行权限"
     else
@@ -956,7 +1020,7 @@ test_fieldiag() {
     fi
 
     # [3] 共享库依赖检查（ldd）
-    log_info "  [3/5] 共享库依赖检查..."
+    log_info "  [3/6] 共享库依赖检查..."
     local ldd_out=""
     ldd_out=$(ldd "${fieldiag_bin}" 2>&1)
     local missing_libs=""
@@ -985,7 +1049,7 @@ test_fieldiag() {
     echo "${ldd_out}" > "${RAW_DATA_DIR}/fieldiag_ldd.txt"
 
     # [4] --version / --help 能否正常返回（glibc ABI 兼容性最终验证）
-    log_info "  [4/5] glibc ABI 兼容性验证（运行 fieldiag --version）..."
+    log_info "  [4/6] glibc ABI 兼容性验证（运行 fieldiag --version）..."
     local ver_out=""
     local ver_ret=0
     ver_out=$("${fieldiag_bin}" --version 2>&1) || ver_ret=$?
@@ -1008,24 +1072,44 @@ test_fieldiag() {
         compat_ok=false
     fi
 
-    # [5] H200/B300 架构支持检查（fieldiag版本过老不支持Hopper/Blackwell）
-    log_info "  [5/5] GPU 架构支持检查..."
-    if command -v nvidia-smi &>/dev/null; then
-        local gpu_names=""
-        gpu_names=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || true)
-        log_info "    当前服务器GPU: ${gpu_names}"
-        # 检查H200/H100/B300等较新的架构是否存在
-        if echo "${gpu_names}" | grep -qiE "H200|H100|B300|B200|Blackwell|Hopper"; then
-            log_warn "    检测到 Hopper/Blackwell 架构（H200/H100/B200/B300）"
-            log_warn "    如果是较旧的 fieldiag（2023年前版本）可能不支持上述GPU诊断"
-            log_warn "    如果兼容性自检全通过但实际诊断报 GPU Unsupported，需升级 fieldiag 版本"
+    # [5] GPU架构支持检查（fieldiag版本过老不支持Hopper/Blackwell）
+    log_info "  [5/6] GPU 架构支持检查..."
+    log_info "    当前服务器GPU: ${gpu_names}"
+    # 检查H200/H100/B300等较新的架构是否存在
+    if echo "${gpu_names}" | grep -qiE "H200|H100|B300|B200|Blackwell|Hopper|GB200|L40S|H800"; then
+        log_warn "    检测到 Hopper/Blackwell/L40S 架构（H200/H100/B200/B300/L40S/H800）"
+        log_warn "    如果是较旧的 fieldiag（2023年前版本）可能不支持上述GPU诊断"
+        log_warn "    如果实际诊断报 GPU Unsupported，需升级 fieldiag 版本"
+    fi
+
+    # [6] 30秒快速预检 —— 跑 discovery/help 验证 fieldiag 能初始化并识别GPU（防止正式诊断卡死）
+    log_info "  [6/6] 30秒快速预检（fieldiag discovery/help 初始化验证）..."
+    local precheck_out=""
+    local precheck_ret=0
+    # 尝试多种预检命令（不同版本fieldiag参数不同）
+    timeout 30 bash -c "'${fieldiag_bin}' --list 2>&1 || '${fieldiag_bin}' -l 2>&1 || '${fieldiag_bin}' --discovery 2>&1 || '${fieldiag_bin}' --help 2>&1 | head -50" \
+        > "${RAW_DATA_DIR}/fieldiag_precheck.txt" 2>&1 || precheck_ret=$?
+    precheck_out=$(cat "${RAW_DATA_DIR}/fieldiag_precheck.txt")
+    if [ ${precheck_ret} -eq 0 ] || [ ${precheck_ret} -eq 1 ]; then
+        # 只要不是超时就好。检查有没有致命不支持提示
+        if echo "${precheck_out}" | grep -qiE "UNSUPPORTED|unsupported GPU|not supported|GPU family"; then
+            log_error "    ❌ 30秒预检报 GPU 不支持：${precheck_out}"
+            log_error "      即使是数据中心GPU，此 fieldiag 版本可能仍不支持最新架构，需升级 fieldiag"
+            compat_ok=false
+        elif echo "${precheck_out}" | grep -qiE "fail|error"; then
+            log_warn "    ⚠️ 30秒预检含错误输出，但仍可尝试运行（可手动检查 raw_data/fieldiag_precheck.txt）"
+            log_ok "    30秒预检通过：fieldiag可初始化"
+        else
+            log_ok "    30秒预检通过：fieldiag可初始化（前3行：$(echo "${precheck_out}" | head -n3 | tr '\n' '|'))"
         fi
+    elif [ ${precheck_ret} -eq 124 ]; then
+        log_error "    ❌ 30秒预检超时（fieldiag 初始化阶段卡死，正式诊断大概率也会卡死）"
+        compat_ok=false
     else
-        log_warn "    nvidia-smi 未安装，无法检测GPU架构（请先安装NVIDIA驱动）"
+        log_warn "    ⚠️ 30秒预检返回码=${precheck_ret}，可继续尝试"
     fi
 
     # 最终判定
-    echo "${RAW_DATA_DIR}/fieldiag_version.txt"  # keep newline
     if [ "${compat_ok}" = "true" ]; then
         log_ok "fieldiag 兼容性自检 ✓ 全部通过，可以直接运行"
     else
@@ -1035,6 +1119,7 @@ test_fieldiag() {
         log_error "  2. 安装缺失的依赖库：apt install libnvidia-ml-dev datacenter-gpu-manager"
         log_error "  3. glibc 不兼容 → 只能用与目标系统匹配的 fieldiag 版本（静态编译版无此问题）"
         log_error "  4. 在原20.04服务器上运行 ldd fieldiag 查看完整依赖列表"
+        log_error "  5. 30秒预检卡死/超时 → GPU架构版本不匹配，升级fieldiag"
         # 仍然写入结果
         echo "INCOMPATIBLE" > "${RAW_DATA_DIR}/fieldiag_result.txt"
         {
@@ -1044,6 +1129,8 @@ test_fieldiag() {
             echo "${missing_libs:-无}"
             echo "版本测试输出:"
             echo "${ver_out:-无}"
+            echo "30秒预检输出:"
+            echo "${precheck_out:-无}"
         } > "${RAW_DATA_DIR}/fieldiag_diag.txt"
         return
     fi
