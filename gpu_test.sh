@@ -394,14 +394,56 @@ auto_install_driver_cuda_runfile() {
     chmod +x "${runfile_path}" 2>/dev/null || true
 
     # ── 3. 关闭 nouveau 开源驱动 + 写入黑名单（防止和官方驱动抢设备）──
+    #    ★★ 高风险操作保护 ★★
+    #    - 先备份 initrd.img
+    #    - 验证 /boot/vmlinuz-$(uname -r) 和 initrd.img 是否都存在、大小正常
+    #    - 一旦 update-initramfs 失败立刻还原备份、绝对不主动 reboot
+    #    - 如检测到正在 dist-upgrade / 内核包替换期间 → 只写黑名单，不重建 initramfs（延后到下一次正常启动）
     if lsmod 2>/dev/null | grep -q nouveau; then
-        log_info "🔧 检测到 nouveau 开源驱动正在运行，写入黑名单并重建 initramfs"
+        log_info "🔧 检测到 nouveau 开源驱动正在运行，写入黑名单..."
+        local initramfs_safe=true
+        local running_kver=""
+        running_kver="$(uname -r)"
+        # 安全条件1：正在进行的 apt/dpkg 进程不能存在
+        if pidof apt-get apt dpkg >/dev/null 2>&1; then
+            log_warn "⚠️  检测到 apt/dpkg 进程仍在运行（可能在 dist-upgrade 或内核替换中），本阶段不重建 initramfs，避免破坏 initrd"
+            initramfs_safe=false
+        fi
+        # 安全条件2：/boot 下当前内核的 vmlinuz 和 initrd 必须齐全
+        if [ ! -f "/boot/vmlinuz-${running_kver}" ] || [ ! -f "/boot/initrd.img-${running_kver}" ]; then
+            log_warn "⚠️  /boot 下当前内核(${running_kver})的 vmlinuz/initrd 缺失，重建 initramfs 风险极高，跳过重建"
+            initramfs_safe=false
+        fi
+        # 安全条件3：磁盘空间够（/boot < 20% 可用就不搞）
+        local boot_avail
+        boot_avail="$(df -k /boot 2>/dev/null | awk 'NR==2 {print $4}' || echo 0)"
+        if [ -n "${boot_avail}" ] && [ "${boot_avail}" -lt 102400 ]; then  # <100MB
+            log_warn "⚠️  /boot 可用空间不足 ${boot_avail} KB，重建 initramfs 可能写坏 initrd，跳过重建"
+            initramfs_safe=false
+        fi
+
+        # 写黑名单配置（这个操作是安全的，只是一个文本文件，不影响当前内核）
         sudo tee /etc/modprobe.d/blacklist-nouveau.conf >/dev/null <<'EOF'
 blacklist nouveau
 options nouveau modeset=0
 EOF
-        sudo update-initramfs -u 2>&1 | tee -a "${LOG_FILE}" || true
-        log_warn "⚠️  nouveau 已加入黑名单，驱动安装完成后需要 reboot 才能完全生效"
+
+        if [ "${initramfs_safe}" = "true" ]; then
+            log_info "📦 安全条件通过：先备份当前 initrd.img-${running_kver}，再重建 initramfs"
+            ( sudo cp -a "/boot/initrd.img-${running_kver}" "/boot/initrd.img-${running_kver}.gpu_test_bak_$(date +%Y%m%d_%H%M%S)" 2>&1 | tee -a "${LOG_FILE}" ) || true
+            local uif_rc=0
+            sudo update-initramfs -u -k "${running_kver}" 2>&1 | tee -a "${LOG_FILE}" || uif_rc=$?
+            if [ "${uif_rc}" -ne 0 ] || [ ! -s "/boot/initrd.img-${running_kver}" ]; then
+                log_error "❌ update-initramfs 失败！立刻还原 initrd 备份，阻止可能的无法启动"
+                ( sudo cp -a "/boot/initrd.img-${running_kver}.gpu_test_bak_"* "/boot/initrd.img-${running_kver}" 2>&1 | tee -a "${LOG_FILE}" ) || true
+                log_warn "⚠️  nouveau 黑名单只写入了 /etc/modprobe.d 但没进 initrd，下次正常 apt upgrade 时会自动补重建"
+            else
+                log_ok "✅ initramfs 重建成功，nouveau 已加入黑名单（驱动安装完成后需要 reboot 才能完全生效）"
+            fi
+        else
+            log_warn "⚠️  只写了 /etc/modprobe.d/blacklist-nouveau.conf，未立刻重建 initrd（等下次自然升级时自动重建更安全）"
+        fi
+        log_warn "💡 提示：驱动安装完成后确实需要 reboot 才会禁用 nouveau，但不要在 apt/dpkg 还没结束时重启！"
     fi
 
     # ── 4. 检测图形界面（X/Wayland），决定是否切 tty ──
@@ -959,37 +1001,51 @@ check_nvidia_driver() {
     # ═══════════════════════════════════════════════════════
     # ★ 到这里：文件都装好了但内核模块没加载 → 做最后抢救
     # ═══════════════════════════════════════════════════════
-    log_info "🔧 最后抢救：重新黑名单 nouveau + 重建 initramfs + dkms 全量编译"
-    # 1. nouveau 黑名单（不管之前有没有写过，强制再写一次）
+    log_info "🔧 最后抢救：重新黑名单 nouveau + dkms 全量编译"
+    # ⚠️  绝对不在这里随便 update-initramfs -k all！！
+    # 之前已经出过把用户送进 BusyBox initramfs 的事故了。
+    # 只写 modprobe.d 黑名单，不碰 initrd；dkms 只编当前运行内核的模块
     sudo tee /etc/modprobe.d/blacklist-nouveau.conf >/dev/null <<'EOF'
 blacklist nouveau
 options nouveau modeset=0
 EOF
-    sudo update-initramfs -u -k all 2>&1 | tee -a "${LOG_FILE}" || true
-    # 2. dkms 重建所有 nvidia 模块
+    # 2. dkms 只重建当前运行内核的 nvidia 模块（其他内核不碰）
     local kver
     kver="$(uname -r)"
     ( sudo apt-get install -y --no-install-recommends "linux-headers-${kver}" 2>&1 | tee -a "${LOG_FILE}" ) || true
     ( sudo dkms autoinstall -k "${kver}" 2>&1 | tee -a "${LOG_FILE}" ) || true
-    ( sudo depmod -a 2>&1 | tee -a "${LOG_FILE}" ) || true
-    # 3. 先卸 nouveau 再加载 nvidia（如果没在图形界面里）
-    ( sudo rmmod nouveau 2>&1 | tee -a "${LOG_FILE}" ) || true
+    ( sudo depmod -a -F "/boot/System.map-${kver}" 2>&1 | tee -a "${LOG_FILE}" ) || true
+    # 3. 尝试不卸 nouveau 直接装 nvidia（卸 nouveau 太危险，容易让桌面崩溃）
     ( sudo modprobe nvidia nvidia_modeset nvidia_uvm nvidia_drm 2>&1 | tee -a "${LOG_FILE}" ) || true
+    # 4. 如果没加载上，就再试一次 nouveau unbind 方案（不 rmmod，只从驱动解绑设备）
+    if ! verify_driver_loaded; then
+        local pci_list=""
+        pci_list="$(lspci -d 10de: -MM 2>/dev/null | awk '{print $1}' || true)"
+        local bdf
+        for bdf in ${pci_list}; do
+            if [ -L "/sys/bus/pci/drivers/nouveau/${bdf}" ]; then
+                log_info "  把设备 ${bdf} 从 nouveau 驱动解绑..."
+                ( sudo sh -c "echo '${bdf}' > /sys/bus/pci/drivers/nouveau/unbind" 2>&1 | tee -a "${LOG_FILE}" ) || true
+            fi
+        done
+        ( sudo modprobe nvidia nvidia_modeset nvidia_uvm nvidia_drm 2>&1 | tee -a "${LOG_FILE}" ) || true
+    fi
 
     if verify_driver_loaded; then
-        log_ok "🎉 抢救成功！GPU 已识别（建议还是 reboot 一次保证长期稳定）"
+        log_ok "🎉 抢救成功！GPU 已识别（建议先跑完测试再 reboot，避免又卡 initrd）"
         return 0
     fi
 
     # ── 实在不行了，明确告诉用户为什么 ──
     log_error "================================================================="
-    log_error "❌ 驱动文件都装好了，但内核模块就是加载不出来。最常见 3 个原因："
+    log_error "❌ 驱动文件都装好了，但内核模块加载失败。常见 3 个原因："
     log_error "  1️⃣  Secure Boot 开着（BIOS 里启用了 MOK 签名）→ 进 BIOS 关闭 Secure Boot"
-    log_error "  2️⃣  nouveau 还占着设备（initramfs 里还没清掉）→ 必须 sudo reboot"
+    log_error "  2️⃣  nouveau 还占着设备（initramfs 里还没清掉）→ 需要 reboot 才能禁用 nouveau"
     log_error "  3️⃣  linux-headers 版本不匹配当前内核 → 看上面 dkms autoinstall 报错"
     log_error ""
-    log_error "👉 请现在执行：sudo reboot"
-    log_error "   重启后不要再手工装任何东西，直接再执行一次 ./gpu_test.sh 就能直接进测试"
+    log_error "👉 先别慌重启！先确认当前 /boot/initrd.img-$(uname -r) 存在且大小正常再重启："
+    log_error "   ls -lh /boot/initrd.img-$(uname -r) /boot/vmlinuz-$(uname -r)"
+    log_error "   两个文件都 ≥30MB 才 reboot，否则联系脚本维护者"
     log_error "================================================================="
     return 1
 }
