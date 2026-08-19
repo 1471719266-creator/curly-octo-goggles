@@ -1,2175 +1,1633 @@
-#!/bin/bash
-#===============================================================================
-# NVIDIA GPU 售后服务自动化测试脚本
-# 支持 Ubuntu 24.x 系列，兼容 H100 ~ B300 全系列数据中心/消费级 GPU
-# 测试工具：NVIDIA CUDA Toolkit (官方) + DCGM (官方数据中心诊断)
-# 直接复制使用：  bash gpu_test.sh    （首次会自动 chmod +x，下次可 ./gpu_test.sh）
-#===============================================================================
-set -o pipefail
+#!/bin/bash ; set -o pipefail
 
-# ================================================================
-# 【第-2步：核心全局工具函数】（必须放在最前面，所有后续函数都依赖）
-#   1) check_net_reachable(): 网络可达检测（优先 ping，失败再 /dev/tcp）
-#   2) run_apt_safe(): apt 安全执行器（自动判断 SIGSEGV 崩溃 + 触发自愈）
-#   3) apt_selfcheck_repair(): 5 层 apt/dpkg 自愈（clean/lists/avail/configure/fix-missing）
-# ================================================================
+# ==================== 顺序2: 基础变量 + 立即mkdir保证LOG_FILE可用 ====================
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TS_START="$(date +%Y%m%d_%H%M%S)"
+OUTPUT_DIR="${SCRIPT_DIR}/gpu_test_output_${TS_START}"
+LOG_FILE="${OUTPUT_DIR}/test.log"
+RAW_DATA_DIR="${OUTPUT_DIR}/raw_data"
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
 
-# ---------- 网络可达检测：优先 ping（实测证明用户 ICMP 通），失败再 /dev/tcp ----------
+mkdir -p "${OUTPUT_DIR}" "${RAW_DATA_DIR}"
+touch "${LOG_FILE}"
+
+# ==================== 顺序3: init() 函数定义 ====================
+init() {
+    PAUSE_MARKER="${OUTPUT_DIR}/.pause_marker"
+    MANUAL_PAUSE="${OUTPUT_DIR}/.manual_pause"
+    WATCHDOG_PID_FILE="${OUTPUT_DIR}/.watchdog_pid"
+    TEMP_LOG="${OUTPUT_DIR}/watchdog_temp.log"
+    GPU_COUNT_FILE="${OUTPUT_DIR}/gpu_count.txt"
+    CUDA_BIN_DIR_FILE="${OUTPUT_DIR}/cuda_bin_dir.txt"
+    FACTORY_BIN_DIR_FILE="${OUTPUT_DIR}/factory_bin_dir.txt"
+    FIELDIAG_RESULT_FILE="${OUTPUT_DIR}/fieldiag_result.txt"
+    RUN_CONFIG_FILE="${OUTPUT_DIR}/run_config.yml"
+    FAILURE_DIAGNOSIS_FILE="${OUTPUT_DIR}/failure_diagnosis.txt"
+    REPORT_DATA_JSON="${OUTPUT_DIR}/report_data.json"
+    rm -f "${PAUSE_MARKER}" "${MANUAL_PAUSE}" "${WATCHDOG_PID_FILE}"
+    touch "${TEMP_LOG}"
+}
+
+# ==================== 顺序4: log() / log_info / log_ok / log_warn / log_error 函数定义 ====================
+log() {
+    local level="$1"; shift
+    local msg="$*"
+    local ts="$(date '+%Y-%m-%d %H:%M:%S')"
+    local line=""
+    case "${level}" in
+        INFO)    line="${CYAN}[INFO ]${NC} ${msg}" ;;
+        OK)      line="${GREEN}[ OK  ]${NC} ${msg}" ;;
+        WARN)    line="${YELLOW}[WARN ]${NC} ${msg}" ;;
+        ERROR)   line="${RED}[ERROR]${NC} ${msg}" ;;
+        *)       line="[${level}] ${msg}" ;;
+    esac
+    echo -e "${line}" | tee -a "${LOG_FILE}"
+}
+
+log_info()  { log INFO  "$*"; }
+log_ok()    { log OK    "$*"; }
+log_warn()  { log WARN  "$*"; }
+log_error() { log ERROR "$*"; }
+
+# ==================== 顺序5: 三个核心工具函数 ====================
+
 check_net_reachable() {
-    # 先试 ping（-c 2 发2包, -W 3 等3秒, -q 安静）— ICMP 防火墙最不容易挡
-    local ping_targets=("mirrors.aliyun.com" "archive.ubuntu.com" "baidu.com" "github.com")
-    for t in "${ping_targets[@]}"; do
-        if ( ping -c 2 -W 3 -q "${t}" &>/dev/null ); then
-            return 0
+    local targets=("mirrors.aliyun.com" "archive.ubuntu.com" "baidu.com" "github.com")
+    local ok_count=0
+    for t in "${targets[@]}"; do
+        if ping -c 2 -W 3 "${t}" >/dev/null 2>&1; then
+            ok_count=$((ok_count + 1))
         fi
     done
-    # ping 不通再试 /dev/tcp TCP 80/443（有些环境禁 ICMP 但开放 TCP）
-    local tcp_targets=("mirrors.aliyun.com:80" "archive.ubuntu.com:80" "github.com:443")
-    for tp in "${tcp_targets[@]}"; do
-        local host="${tp%:*}"
-        local port="${tp##*:}"
-        if ( timeout 5 bash -c "exec 3<>/dev/tcp/${host}/${port}" &>/dev/null ); then
-            return 0
-        fi
-    done
-    return 1
-}
-
-# ---------- APT 5 层自愈：碰到 SIGSEGV / dpkg 损坏时自动跑 ----------
-apt_selfcheck_repair() {
-    log_warn "🔧 检测到 apt/dpkg 状态异常，开始 5 层自动修复..."
-    # 把当前 apt 配置和源写进日志，方便以后追溯
-    ( apt-get --version >> "${LOG_FILE}" 2>&1 ) || true
-    ( cat /etc/apt/sources.list >> "${LOG_FILE}" 2>&1 ) || true
-    ( ls -la /etc/apt/sources.list.d/ >> "${LOG_FILE}" 2>&1 ) || true
-
-    log_warn "  [修复1/5] 删除 apt/dpkg 锁 + dpkg --configure -a ..."
-    ( sudo rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend ) || true
-    ( sudo dpkg --configure -a --force-confdef --force-confold >> "${LOG_FILE}" 2>&1 ) || true
-
-    log_warn "  [修复2/5] apt clean + 清空 lists 目录（索引可能损坏导致段错误）..."
-    ( sudo apt-get clean >> "${LOG_FILE}" 2>&1 ) || true
-    ( sudo rm -rf /var/lib/apt/lists/* ) || true
-    ( sudo mkdir -p /var/lib/apt/lists/partial ) || true
-
-    log_warn "  [修复3/5] dpkg --clear-avail + --update-avail（清空可用包缓存）..."
-    ( sudo dpkg --clear-avail >> "${LOG_FILE}" 2>&1 ) || true
-    if [ -d "/var/lib/dpkg/info" ]; then
-        ( sudo dpkg --update-avail /var/lib/dpkg/available >> "${LOG_FILE}" 2>&1 ) || true
-    fi
-
-    log_warn "  [修复4/5] apt-get update --fix-missing（不设 --fix-missing 会一直拿坏索引）..."
-    ( sudo DEBIAN_FRONTEND=noninteractive apt-get update --fix-missing --allow-releaseinfo-change >> "${LOG_FILE}" 2>&1 ) || true
-
-    log_warn "  [修复5/5] apt-get -f install（修复缺依赖 / 半安装包）..."
-    ( sudo DEBIAN_FRONTEND=noninteractive apt-get install -f -y --fix-broken >> "${LOG_FILE}" 2>&1 ) || true
-
-    # 验证修复结果：跑一次 apt-cache stats（段错误的 apt 一般这里也崩）
-    log_warn "  修复完成，正在验证 apt 是否可用..."
-    if ( sudo apt-cache stats &>/dev/null ) && ( sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq >> "${LOG_FILE}" 2>&1 ); then
-        log_ok "apt/dpkg 状态已修复，后续安装继续"
+    if [ "${ok_count}" -ge 2 ]; then
         return 0
-    else
-        log_error "═══════════════════════════════════════════════════════════════"
-        log_error "❌ 自动修复 5 层都没搞定 —— apt/dpkg 仍然 segfault / 损坏"
-        log_error "═══════════════════════════════════════════════════════════════"
-        log_error "⚠️  这不是脚本的 bug，是 Ubuntu 系统自身的包管理器损坏（apt 崩溃）"
-        log_error "手动修复建议（依次尝试）："
-        log_error "  方案1（最快）：从其他相同版本 24.10 机器拷贝"
-        log_error "    sudo cp -a /var/lib/dpkg/info/* /var/lib/dpkg/info.bak/  && sudo dpkg --configure -a"
-        log_error "  方案2（重装 apt 二进制）："
-        log_error "    sudo dpkg --remove --force-remove-reinstreq apt libapt-pkg6.0 2>/dev/null || true"
-        log_error "    从 packages.ubuntu.com 下载 apt_*.deb libapt-pkg6.0_*.deb"
-        log_error "    sudo dpkg -i /tmp/apt_*.deb /tmp/libapt-pkg6.0_*.deb"
-        log_error "  方案3（终极）：如果 H200 只是想先跑 nvidia-smi/压力，直接手动装驱动跳过 apt"
-        log_error "    从 NVIDIA 官网下载 .run 驱动：sudo sh NVIDIA-Linux-x86_64-*.run -s"
-        log_error "═══════════════════════════════════════════════════════════════"
-        log_error "脚本当前会继续，但所有 apt 安装步骤都会跳过，请按上述方案修复 apt 后再重跑"
-        return 1
     fi
+    for t in "${targets[@]}"; do
+        for port in 80 443; do
+            if (echo > "/dev/tcp/${t}/${port}") >/dev/null 2>&1; then
+                ok_count=$((ok_count + 1))
+                break
+            fi
+        done
+    done
+    [ "${ok_count}" -ge 2 ] && return 0 || return 1
 }
 
-# ---------- apt 安全执行器：统一包裹所有 apt-get 调用 ----------
-#   用法：run_apt_safe [update|install|...] [args...]
-#   特性：子shell隔离 → exit 139(SIGSEGV) 触发自愈 → 最多重试 1 次
+apt_selfcheck_repair() {
+    log_warn "触发APT自愈流程（共5层）..."
+    local rc=0
+
+    log_info "[APT自愈 1/5] 删除锁文件 + dpkg --configure -a"
+    sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock 2>/dev/null || true
+    sudo dpkg --configure -a 2>&1 | tee -a "${LOG_FILE}" || rc=$?
+
+    log_info "[APT自愈 2/5] apt clean + 清理 lists"
+    sudo apt-get clean 2>&1 | tee -a "${LOG_FILE}" || true
+    sudo rm -rf /var/lib/apt/lists/* 2>/dev/null || true
+
+    log_info "[APT自愈 3/5] dpkg clear-avail + update-avail"
+    sudo dpkg --clear-avail 2>&1 | tee -a "${LOG_FILE}" || true
+    sudo dpkg --update-avail 2>&1 | tee -a "${LOG_FILE}" || true
+
+    log_info "[APT自愈 4/5] apt update --fix-missing"
+    sudo apt-get update --fix-missing 2>&1 | tee -a "${LOG_FILE}" || rc=$?
+
+    log_info "[APT自愈 5/5] apt -f install"
+    sudo DEBIAN_FRONTEND=noninteractive apt-get -f install -y 2>&1 | tee -a "${LOG_FILE}" || rc=$?
+
+    if [ "${rc}" -ne 0 ]; then
+        log_error "APT自动5层自愈仍失败，请手动选择以下3套方案之一修复："
+        echo -e "    ${BOLD}方案1 (复制dpkg info):${NC}"
+        echo "      sudo cp /var/lib/dpkg/info/* /tmp/dpkg_info_bak/ 2>/dev/null"
+        echo "      sudo rm -rf /var/lib/dpkg/info/* && sudo apt-get update"
+        echo "      sudo dpkg --configure -a && sudo apt-get -f install -y"
+        echo ""
+        echo -e "    ${BOLD}方案2 (重装apt deb):${NC}"
+        echo "      cd /tmp && sudo apt-get download apt"
+        echo "      sudo dpkg -i --force-depends apt_*.deb && sudo apt-get update"
+        echo ""
+        echo -e "    ${BOLD}方案3 (NVIDIA .run 驱动直装 - 跳APT):${NC}"
+        echo "      # 去 https://www.nvidia.com/Download/index.aspx 下载对应 .run"
+        echo "      sudo systemctl stop gdm3 2>/dev/null; sudo sh NVIDIA-Linux-*.run"
+        return "${rc}"
+    fi
+    log_ok "APT自愈完成"
+    return 0
+}
+
 run_apt_safe() {
-    local apt_action="$1"; shift
-    local -a apt_args=("$@")
+    local action="$1"; shift
     local rc=0
     local retried=false
-
     while true; do
-        ( sudo DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" "${apt_action}" "${apt_args[@]}" >> "${LOG_FILE}" 2>&1 )
+        (
+            sudo DEBIAN_FRONTEND=noninteractive apt-get "${action}" "$@"
+        )
         rc=$?
-        # exit 139 = 128 + 11 = SIGSEGV（段错误）
         if [ "${rc}" -eq 139 ] || [ "${rc}" -eq 134 ]; then
-            log_error "⚠️  apt-get ${apt_action} 触发段错误（exit=${rc}），立即启动 apt_selfcheck_repair"
-            if apt_selfcheck_repair && [ "${retried}" = "false" ]; then
+            log_warn "apt收到信号 rc=${rc} (SIGSEGV=139 / SIGABRT=134)，启动apt_selfcheck_repair"
+            apt_selfcheck_repair || true
+            if [ "${retried}" = "false" ]; then
+                log_info "重试一次 apt ${action} ..."
                 retried=true
-                log_warn "修复成功，重试一次 apt-get ${apt_action} ..."
                 continue
             else
+                log_error "apt ${action} 重试后仍失败 rc=${rc}"
                 return "${rc}"
             fi
         fi
-        break
+        return "${rc}"
     done
-    return "${rc}"
 }
 
-# ================================================================
-# 【第-1步：全局安全壳】捕获段错误/子进程崩溃，不让主脚本跟着崩
-#   照片里出现的 "Segmentation fault" 是 sudo apt-get install 子进程崩了
-#   （无网络/源损坏时 apt 偶发段错误），这里用 trap + 子shell 隔离
-# ================================================================
-trap 'echo -e "\033[1;33m[安全壳] 检测到非0退出码 $?，但主脚本继续运行（若为apt/sudo段错误属正常，已隔离）\033[0m" >&2' ERR 2>/dev/null || true
-# 屏蔽 SIGPIPE / 子shell SIGSEGV 向主脚本传导（Ubuntu上apt段错误会顺带影响父进程）
+# ==================== 顺序6: 全局安全壳 trap ERR + ulimit -c 0 ====================
+trap 'log_error "Trap ERR: line=$LINENO cmd=$BASH_COMMAND rc=$?"' ERR
 ulimit -c 0 2>/dev/null || true
 
-# ================================================================
-# 【第0步：自授权+重启动】复制到任何目录都能 bash gpu_test.sh 直接运行
-#   效果：首次用 bash 运行后，脚本自动给自己 chmod +x
-#        并重启动为可执行模式，以后直接 ./gpu_test.sh 即可
-# ================================================================
-SELF_CHMOD_DONE="${SELF_CHMOD_DONE:-0}"
-if [ "${SELF_CHMOD_DONE}" != "1" ] && [ -f "${BASH_SOURCE[0]}" ]; then
-    SCRIPT_ABS_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
-    if [ ! -x "${SCRIPT_ABS_PATH}" ]; then
-        echo ">>> 首次运行：自动给脚本添加可执行权限（chmod +x），以后可直接 ./$(basename "${BASH_SOURCE[0]}")"
-        chmod +x "${SCRIPT_ABS_PATH}" 2>/dev/null || true
+# ==================== 顺序7: 自授权 chmod +x 重启动 ====================
+if [ -z "${SELF_CHMOD_DONE}" ]; then
+    if [ ! -x "${BASH_SOURCE[0]}" ]; then
+        chmod +x "${BASH_SOURCE[0]}" 2>/dev/null || true
     fi
-    # 通过环境变量避免无限循环，然后以可执行方式重启动
     export SELF_CHMOD_DONE=1
-    exec "${SCRIPT_ABS_PATH}" "$@"
+    exec bash "${BASH_SOURCE[0]}" "$@"
 fi
 
-# =========================================
-# 配置区（集中管理，便于售后服务追溯）
-# =========================================
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-OUTPUT_DIR="${SCRIPT_DIR}/gpu_test_results_$(date +%Y%m%d_%H%M%S)"
-LOG_FILE="${OUTPUT_DIR}/test.log"
-RAW_DATA_DIR="${OUTPUT_DIR}/raw_data"
-CUDA_VERSION="12.6.1"  # 支持 H100/B200/B300 等最新GPU的稳定CUDA版本
-DCGM_VERSION="3.4.1"
-STRESS_DURATION_SEC=60   # 压力测试(nbody)时长(秒)，售后服务建议60~300秒
-GPUBURN_DURATION_SEC=120 # gpu-burn满载烧机时长(秒/每块GPU)，售后服务建议120~300秒
-FIELD_LEVEL=2            # fieldiag 原厂现场诊断级别: 1=快速(5~15分钟) 2=中等(约4小时) 3=完整(约6小时)
-FORCE_FIELDIAG=false     # 是否强制跳过 fieldiag 预检0~6（确认fieldiag版本+GPU完全匹配时才用）
-TEMP_ALARM_C=90          # 温度报警阈值（℃），超过则自动暂停测试，低于冷却阈值后继续
-TEMP_COOLDOWN_C=75       # 冷却恢复温度（℃），低于此值自动恢复测试
-TEMP_CHECK_INTERVAL=5    # 温度检查间隔(秒)
-PAUSE_MARKER=""          # 暂停标记文件路径，init()里会赋值
+# ==================== 顺序8: 配置区（全局变量） ====================
+CUDA_VERSION="12.6.1"
+CUDA_RUNFILE_VERSION="560.35.05"
+STRESS_DURATION_SEC=60
+GPUBURN_DURATION_SEC=120
+FIELD_LEVEL=1
+TEMP_ALARM_C=90
+TEMP_COOLDOWN_C=$((TEMP_ALARM_C - 15))
+SKIP_INSTALL=false
+STRESS_ONLY=false
+FORCE_FIELDIAG=false
+NET_REACHABLE_CACHED=""
 
-# 颜色输出
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
-
-# =========================================
-# 初始化
-# =========================================
-init() {
-    mkdir -p "${OUTPUT_DIR}" "${RAW_DATA_DIR}"
-    touch "${LOG_FILE}"
-    exec 2> >(tee -a "${LOG_FILE}" >&2)
-    PAUSE_MARKER="${OUTPUT_DIR}/.pause"
-    MANUAL_PAUSE="${OUTPUT_DIR}/.manual_pause"
-    TEMP_WATCHDOG_LOG="${OUTPUT_DIR}/watchdog_temp.log"
-    rm -f "${PAUSE_MARKER}" "${MANUAL_PAUSE}" "${TEMP_WATCHDOG_LOG}"
-    # 写一个 crash 标记文件，即使主进程异常也能让下次知道上次没跑完
-    echo "STARTED $(date '+%Y-%m-%d %H:%M:%S')" > "${OUTPUT_DIR}/.session_marker"
+# ==================== 顺序9: save_raw() 函数 ====================
+save_raw() {
+    local name="$1"; shift
+    local out_file="${RAW_DATA_DIR}/${name}.txt"
+    {
+        echo "===== ${name} @ $(date '+%Y-%m-%d %H:%M:%S') ====="
+        echo "\$ $*"
+        echo "--------------------------------------------------"
+        "$@" 2>&1
+        echo ""
+        echo "===== exit=$? ====="
+    } > "${out_file}" 2>&1 || true
+    log_info "原始数据已保存: ${name}.txt"
 }
 
-# ================================================================
-# 启动交互菜单（无参数模式）—— 售后服务工程师最常用
-# ================================================================
+# ==================== 顺序10: interactive_menu() ====================
 interactive_menu() {
-    # 如果不是TTY（比如ssh管道调用），直接使用默认值不交互
-    if [ ! -t 0 ]; then
-        echo "[交互菜单] 非终端环境，使用默认值: 压力=${STRESS_DURATION_SEC}s gpu-burn=${GPUBURN_DURATION_SEC}s 温度报警=${TEMP_ALARM_C}℃"
-        return 0
-    fi
+    local DC_GPU_LIST="H100 H200 H800 H900 B200 B300 B380 B390 GB200 GB300 A100 A800 A900 A30 A10 A10G T4 T4g L4 L40 L40S V100 V100S P100 P40 P4 K80 K40 M60 M40 A2 L20 L2 L10 L10G PG500 PG506 PG509 HGX DGX Tesla GRID Quadro RTX GV100 GP100"
+    echo ""
+    echo -e "${BOLD}${CYAN}============================================${NC}"
+    echo -e "${BOLD}${CYAN} NVIDIA GPU 售后服务自动化测试 - 交互配置 ${NC}"
+    echo -e "${BOLD}${CYAN}============================================${NC}"
+    echo ""
 
-    # ================================================================
-    # 进入菜单前先判断：fieldiag 菜单有没有必要显示
-    #   只有满足 (A) fieldiag二进制存在  且  (B) 至少1块数据中心GPU → 才显示Level选择
-    #   否则直接一句话提示并跳过，不浪费用户时间
-    # ================================================================
-    local show_field_level=false
-    local field_skip_reason=""
-
+    local have_fieldiag=false
     local f_bin=""
-    for p in /usr/local/cuda/bin/fieldiag /usr/local/cuda/bin/nvidia-fieldiag \
-        /opt/nvidia/fieldiag /opt/nvidia/fieldiag/bin/fieldiag \
-        /usr/bin/fieldiag /usr/bin/nvidia-fieldiag \
-        "${SCRIPT_DIR}/fieldiag" "${SCRIPT_DIR}/tools/fieldiag"; do
-        [ -x "${p}" ] && f_bin="${p}" && break
+    for p in /usr/local/cuda/bin/fieldiag /opt/nvidia/fieldiag/bin/fieldiag /usr/bin/fieldiag "${SCRIPT_DIR}/fieldiag"; do
+        if [ -x "${p}" ]; then have_fieldiag=true; f_bin="${p}"; break; fi
     done
-    [ -z "${f_bin}" ] && f_bin=$(command -v fieldiag 2>/dev/null || command -v nvidia-fieldiag 2>/dev/null || true)
+    if [ -z "${f_bin}" ]; then f_bin="$(command -v fieldiag 2>/dev/null || true)"; fi
+    [ -n "${f_bin}" ] && [ -x "${f_bin}" ] && have_fieldiag=true
 
-    local gpu_names=""
-    command -v nvidia-smi &>/dev/null && gpu_names=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || true)
-    local has_datacenter=false
-    if [ -n "${gpu_names}" ]; then
-        while IFS= read -r gn; do
-            [ -z "${gn}" ] && continue
-            if echo "${gn}" | grep -qiE "(H100|H200|H800|H900|B200|B300|B380|B390|GB200|GB300|A100|A800|A900|A30|A10|A10G|T4|T4g|L4|L40|L40S|V100|V100S|P100|P40|P4|K80|K40|M60|M40|A2|L20|L2|L10|L10G|PG500|PG506|PG509|HGX|DGX|Tesla|GRID|Quadro (RTX|GV100|GP100))"; then
-                has_datacenter=true; break
+    local have_dc_gpu=false
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        local gpu_names
+        gpu_names="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || true)"
+        for g in ${DC_GPU_LIST}; do
+            if echo "${gpu_names}" | grep -qi "${g}"; then
+                have_dc_gpu=true
+                break
             fi
-        done <<< "${gpu_names}"
+        done
     fi
 
-    if [ -n "${f_bin}" ] && [ "${has_datacenter}" = "true" ]; then
-        show_field_level=true
+    echo -e "${BLUE}步骤1/4: 压力测试时长设置${NC}"
+    read -r -p "  压力测试持续秒数（默认${STRESS_DURATION_SEC}s）: " _tmp
+    [ -n "${_tmp}" ] && STRESS_DURATION_SEC="${_tmp}"
+
+    echo ""
+    echo -e "${BLUE}步骤2/4: gpu-burn 满载时长设置${NC}"
+    read -r -p "  gpu-burn 持续秒数（默认${GPUBURN_DURATION_SEC}s）: " _tmp
+    [ -n "${_tmp}" ] && GPUBURN_DURATION_SEC="${_tmp}"
+
+    echo ""
+    echo -e "${BLUE}步骤3/4: 温度报警阈值${NC}"
+    read -r -p "  GPU温度报警阈值°C（默认${TEMP_ALARM_C}°C，冷却恢复=阈值-15）: " _tmp
+    if [ -n "${_tmp}" ]; then
+        TEMP_ALARM_C="${_tmp}"
+        TEMP_COOLDOWN_C=$((TEMP_ALARM_C - 15))
+    fi
+
+    echo ""
+    if [ "${have_fieldiag}" = "true" ] && [ "${have_dc_gpu}" = "true" ]; then
+        echo -e "${BLUE}步骤4/4: NVIDIA 原厂 fieldiag 诊断级别（数据中心GPU检测到）${NC}"
+        echo "  Level 0: 仅预检 (约30秒)"
+        echo "  Level 1: 快速诊断 (约5分钟，默认)"
+        echo "  Level 2: 标准诊断 (约20分钟)"
+        echo "  Level 3: 深度诊断 (约1小时)"
+        read -r -p "  请选择 Level (0~3，默认${FIELD_LEVEL}): " _tmp
+        [ -n "${_tmp}" ] && FIELD_LEVEL="${_tmp}"
     else
-        if [ -z "${f_bin}" ]; then
-            field_skip_reason="ℹ️  未找到 fieldiag 二进制，本次自动跳过原厂现场诊断（PCIe/温度等检测仍会完整执行）"
-        elif [ "${has_datacenter}" = "false" ]; then
-            field_skip_reason="ℹ️  检测到消费级/非数据中心GPU，本次自动跳过fieldiag原厂诊断（PCIe/温度等检测仍会完整执行）"
+        echo -e "${BLUE}步骤4/4: fieldiag 原厂诊断${NC}"
+        if [ "${have_fieldiag}" != "true" ]; then
+            log_info "ℹ️  未检测到 fieldiag 二进制，自动跳过原厂诊断（PCIe/温度/显存等测试仍完整执行）"
+        else
+            log_info "ℹ️  未检测到数据中心级GPU（H100/A100/V100等），自动跳过 fieldiag（消费级卡不支持）"
         fi
     fi
 
-    local sel=""
-    local step=0
     echo ""
-    echo "╔══════════════════════════════════════════════════════════════╗"
-    echo "║    NVIDIA GPU 售后服务自动化测试 · 启动配置                 ║"
-    echo "║    直接回车 = 采用默认值，全部保留默认可一路回车到底         ║"
-    echo "╚══════════════════════════════════════════════════════════════╝"
-
-    # ===== 条件显示：fieldiag等级 =====
-    if [ "${show_field_level}" = "true" ]; then
-        step=$((step + 1))
-        echo ""
-        echo "【${step}/4】NVIDIA fieldiag 原厂现场诊断级别："
-        echo "    1) Level 1 快速测试  (~5~15 分钟)  ← 日常验收"
-        echo "    2) Level 2 中等深度  (~4 小时)     ← 默认，推荐售后RMA前"
-        echo "    3) Level 3 完整诊断  (~6 小时)     ← 出厂质检/重大故障深挖"
-        read -rp "    请选择 [默认 2]: " sel
-        case "${sel}" in
-            1) FIELD_LEVEL=1 ;;
-            3) FIELD_LEVEL=3 ;;
-            2|"") FIELD_LEVEL=2 ;;
-            *) echo "    无效选择，保留默认 Level 2"; FIELD_LEVEL=2 ;;
-        esac
+    echo -e "${BOLD}${YELLOW}=========== 最终配置确认 ===========${NC}"
+    echo "  输出目录        : ${OUTPUT_DIR}"
+    echo "  压力测试时长    : ${STRESS_DURATION_SEC} 秒"
+    echo "  gpu-burn 时长   : ${GPUBURN_DURATION_SEC} 秒"
+    echo "  温度报警阈值    : ${TEMP_ALARM_C}°C（冷却恢复: ${TEMP_COOLDOWN_C}°C）"
+    if [ "${have_fieldiag}" = "true" ] && [ "${have_dc_gpu}" = "true" ]; then
+        echo "  fieldiag Level  : ${FIELD_LEVEL}"
     else
-        echo ""
-        echo "${field_skip_reason}"
+        echo "  fieldiag        : 自动跳过"
     fi
-
-    # ===== nbody 压力时长 =====
-    step=$((step + 1))
-    echo ""
-    echo "【${step}/4】① nbody满载压力时长（第10步：算力+温度压力，所有GPU同时跑）："
-    echo "    推荐：60~300 秒；例：60 / 120 / 300 / 600"
-    read -rp "    秒数 [默认 ${STRESS_DURATION_SEC}]: " sel
-    if [ -n "${sel}" ] && [[ "${sel}" =~ ^[0-9]+$ ]] && [ "${sel}" -gt 0 ]; then
-        STRESS_DURATION_SEC="${sel}"
-    else
-        [ -n "${sel}" ] && echo "    无效值，保留默认 ${STRESS_DURATION_SEC} 秒"
-    fi
-
-    # ===== gpu-burn 烧机时长 =====
-    step=$((step + 1))
-    echo ""
-    echo "【${step}/4】② gpu-burn 烧机时长（第13.5步：矩阵乘法正确性 + 满载烧机，逐块GPU单独跑）："
-    echo "    推荐：120~300 秒；总时长 = GPU数量 × 该值"
-    read -rp "    秒数 [默认 ${GPUBURN_DURATION_SEC}]: " sel
-    if [ -n "${sel}" ] && [[ "${sel}" =~ ^[0-9]+$ ]] && [ "${sel}" -gt 0 ]; then
-        GPUBURN_DURATION_SEC="${sel}"
-    else
-        [ -n "${sel}" ] && echo "    无效值，保留默认 ${GPUBURN_DURATION_SEC} 秒"
-    fi
-
-    # ===== 温度报警阈值 =====
-    step=$((step + 1))
-    echo ""
-    echo "【${step}/4】温度报警阈值（超温自动暂停；H100/B300建议92，A100建议90，消费级建议85）："
-    read -rp "    摄氏度 [默认 ${TEMP_ALARM_C}]: " sel
-    if [ -n "${sel}" ] && [[ "${sel}" =~ ^[0-9]+$ ]] && [ "${sel}" -ge 50 ] && [ "${sel}" -le 110 ]; then
-        TEMP_ALARM_C="${sel}"
-    else
-        [ -n "${sel}" ] && echo "    无效值（50~110之间），保留默认 ${TEMP_ALARM_C}℃"
-    fi
-
-    # 冷却恢复温度：用报警-15的默认值即可，菜单里少输一步
-    local default_cool=$(( TEMP_ALARM_C - 15 ))
-    [ "${default_cool}" -lt 40 ] && default_cool=40
-    TEMP_COOLDOWN_C="${default_cool}"
-
-    echo ""
-    echo "╔══════════════════════════════════════════════════════════════╗"
-    echo "║  最终配置确认："
-    if [ "${show_field_level}" = "true" ]; then
-        echo "║   · fieldiag 诊断等级 : Level ${FIELD_LEVEL}   (二进制: ${f_bin})"
-    else
-        echo "║   · fieldiag         : ${field_skip_reason}"
-    fi
-    echo "║   · ① nbody 压力时长 : ${STRESS_DURATION_SEC} 秒（全GPU并行）"
-    echo "║   · ② gpu-burn 时长  : ${GPUBURN_DURATION_SEC} 秒 / 每块GPU"
-    echo "║   · 温度报警 / 恢复  : ≥ ${TEMP_ALARM_C}℃ 暂停 → ≤ ${TEMP_COOLDOWN_C}℃ 自动继续"
-    echo "║   · 运行中手动暂停   : touch \${OUTPUT_DIR}/.manual_pause"
-    echo "║   · 运行中手动恢复   : rm    -f \${OUTPUT_DIR}/.manual_pause"
-    echo "╚══════════════════════════════════════════════════════════════╝"
+    echo -e "${BOLD}${YELLOW}====================================${NC}"
+    read -r -p "按 Enter 确认并开始测试（Ctrl+C 取消）..." _tmp
     echo ""
 }
 
-log() {
-    local level="$1"; shift
-    local msg="[$(date '+%Y-%m-%d %H:%M:%S')][${level}] $*"
-    echo -e "${msg}" | tee -a "${LOG_FILE}"
-}
-
-log_info()  { log "INFO"  "${BLUE}$*${NC}"; }
-log_ok()    { log "OK"    "${GREEN}$*${NC}"; }
-log_warn()  { log "WARN"  "${YELLOW}$*${NC}"; }
-log_error() { log "ERROR" "${RED}$*${NC}"; }
-
-# ================================================================
-# 温度守护进程：后台常驻，每TEMP_CHECK_INTERVAL秒检查一次所有GPU温度
-#   任何一块GPU温度 >= TEMP_ALARM_C → 写入暂停标记 + 报警
-#   所有GPU温度 <= TEMP_COOLDOWN_C → 移除暂停标记 + 继续
-#   支持手动暂停：touch .manual_pause （优先级最高，必须手动删除）
-# ================================================================
+# ==================== 顺序11: start_temp_watchdog() ====================
 start_temp_watchdog() {
-    # 先杀掉上一次可能残留的watchdog（正常流程下不会残留）
-    [ -f "${OUTPUT_DIR}/.watchdog_pid" ] && kill "$(cat "${OUTPUT_DIR}/.watchdog_pid")" 2>/dev/null || true
-    rm -f "${PAUSE_MARKER}" "${OUTPUT_DIR}/.watchdog_pid"
-
-    # 守护进程以子shell方式后台运行，不阻塞主流程
+    log_info "启动温度看门狗后台进程（报警=${TEMP_ALARM_C}°C，冷却恢复=${TEMP_COOLDOWN_C}°C）"
     (
-        echo $$ > "${OUTPUT_DIR}/.watchdog_pid"
-        local last_alert_ts=0
-        local last_resume_ts=0
+        trap 'rm -f "${WATCHDOG_PID_FILE}"; exit 0' EXIT INT TERM
+        echo $$ > "${WATCHDOG_PID_FILE}"
+        local last_log_ts=0
         while true; do
-            sleep "${TEMP_CHECK_INTERVAL}"
-            # 如果 nvidia-smi 不存在就休息（驱动还没装好）
-            command -v nvidia-smi &>/dev/null || continue
-            # 读每块GPU的最高温度（利用query一次获取）
-            local temps
-            temps=$(nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader,nounits 2>/dev/null || true)
-            [ -z "${temps}" ] && continue
-            local max_t=0 min_t=200
-            while IFS= read -r t; do
-                [[ "${t}" =~ ^[0-9]+$ ]] || continue
-                [ "${t}" -gt "${max_t}" ] && max_t="${t}"
-                [ "${t}" -lt "${min_t}" ] && min_t="${t}"
-            done <<< "${temps}"
-            local now_ts
-            now_ts=$(date +%s)
-            # 写 watchdog 日志（每30秒写一条，避免日志爆炸）
-            if [ $(( now_ts % 30 )) -eq 0 ]; then
-                echo "[$(date '+%H:%M:%S')] max=${max_t}C min=${min_t}C | TEMP_ALARM=${TEMP_ALARM_C}C TEMP_COOLDOWN=${TEMP_COOLDOWN_C}C | PAUSE=$( [ -f "${PAUSE_MARKER}" ] && echo Y || echo N ) | MANUAL=$( [ -f "${MANUAL_PAUSE}" ] && echo Y || echo N )" >> "${TEMP_WATCHDOG_LOG}"
-            fi
-            # --- 手动暂停优先级最高：必须等用户手动删除才恢复 ---
             if [ -f "${MANUAL_PAUSE}" ]; then
-                touch "${PAUSE_MARKER}"
-                if [ $(( now_ts - last_alert_ts )) -ge 15 ]; then
-                    last_alert_ts=${now_ts}
-                    # 用tee写入主进程log但不能直接调用log_info（子shell），改为直接写log文件
-                    echo -e "[$(date '+%Y-%m-%d %H:%M:%S')][WARN] ${YELLOW}⚠️  手动暂停生效中：请运行 rm -f ${MANUAL_PAUSE} 恢复${NC}" | tee -a "${LOG_FILE}" >&2
-                fi
+                sleep 2
                 continue
             fi
-            # --- 温度超阈值：自动暂停 ---
+            local max_t=0
+            local min_t=999
+            if command -v nvidia-smi >/dev/null 2>&1; then
+                local temps
+                temps="$(nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader,nounits 2>/dev/null || echo 0)"
+                for t in ${temps}; do
+                    [ "${t}" = "[Not" ] && continue
+                    [ "${t}" = "Supported]" ] && continue
+                    if [ -n "${t}" ] && [ "${t}" -eq "${t}" ] 2>/dev/null; then
+                        [ "${t}" -gt "${max_t}" ] && max_t="${t}"
+                        [ "${t}" -lt "${min_t}" ] && min_t="${t}"
+                    fi
+                done
+            fi
+            local now_ts
+            now_ts="$(date +%s)"
+            if [ $((now_ts - last_log_ts)) -ge 30 ]; then
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] watchdog max=${max_t}°C min=${min_t}°C alarm=${TEMP_ALARM_C} cooldown=${TEMP_COOLDOWN_C}" >> "${TEMP_LOG}"
+                last_log_ts="${now_ts}"
+            fi
             if [ "${max_t}" -ge "${TEMP_ALARM_C}" ]; then
-                touch "${PAUSE_MARKER}"
-                if [ $(( now_ts - last_alert_ts )) -ge 10 ]; then
-                    last_alert_ts=${now_ts}
-                    echo -e "[$(date '+%Y-%m-%d %H:%M:%S')][ERROR] ${RED}🔥 温度报警：最高 GPU ${max_t}℃ ≥ 阈值 ${TEMP_ALARM_C}℃，已自动暂停测试${NC}" | tee -a "${LOG_FILE}" >&2
+                if [ ! -f "${PAUSE_MARKER}" ]; then
+                    log_error "🌡️  GPU温度报警: 最高=${max_t}°C >= 阈值=${TEMP_ALARM_C}°C！写入PAUSE_MARKER暂停测试，等待冷却..."
+                    touch "${PAUSE_MARKER}"
                 fi
-                continue
-            fi
-            # --- 已暂停但温度降到恢复阈值以下：解除自动暂停 ---
-            if [ -f "${PAUSE_MARKER}" ] && [ "${max_t}" -le "${TEMP_COOLDOWN_C}" ] && [ ! -f "${MANUAL_PAUSE}" ]; then
-                rm -f "${PAUSE_MARKER}"
-                if [ $(( now_ts - last_resume_ts )) -ge 5 ]; then
-                    last_resume_ts=${now_ts}
-                    echo -e "[$(date '+%Y-%m-%d %H:%M:%S')][OK] ${GREEN}❄️  已冷却到 ${max_t}℃ ≤ 恢复阈值 ${TEMP_COOLDOWN_C}℃，自动恢复测试${NC}" | tee -a "${LOG_FILE}" >&2
+            elif [ "${max_t}" -le "${TEMP_COOLDOWN_C}" ]; then
+                if [ -f "${PAUSE_MARKER}" ] && [ ! -f "${MANUAL_PAUSE}" ]; then
+                    log_ok "🌡️  GPU温度已冷却: 最高=${max_t}°C <= ${TEMP_COOLDOWN_C}°C，删除PAUSE_MARKER恢复测试"
+                    rm -f "${PAUSE_MARKER}"
                 fi
             fi
+            sleep 5
         done
     ) &
-    local wd_pid=$!
-    # 确保整个主流程退出时把后台守护进程一起杀掉（trap 退出信号）
-    trap 'kill '"${wd_pid}"' 2>/dev/null; [ -f "${OUTPUT_DIR}/.watchdog_pid" ] && kill "$(cat "${OUTPUT_DIR}/.watchdog_pid")" 2>/dev/null || true' EXIT INT TERM
-    log_ok "温度守护进程已启动 (PID=${wd_pid})：最高温度≥${TEMP_ALARM_C}℃自动暂停，≤${TEMP_COOLDOWN_C}℃自动恢复"
-    log_info "手动控制：暂停=touch ${MANUAL_PAUSE}  恢复=rm -f ${MANUAL_PAUSE}  状态=${PAUSE_MARKER}"
+    WATCHDOG_BG_PID=$!
+    log_ok "温度看门狗已启动 (PID=${WATCHDOG_BG_PID})"
+    log_info "手动暂停:  touch ${MANUAL_PAUSE}"
+    log_info "手动恢复:  rm -f ${MANUAL_PAUSE}"
 }
 
-# ================================================================
-# 长时测试前的检查点：
-#   如果存在暂停标记（温度超阈值 or 手动）就 sleep 等待直到标记清除
-# ================================================================
+# ==================== 顺序12: wait_for_ready(caller_name) ====================
 wait_for_ready() {
-    local caller_name="${1:-测试}"
-    if [ -f "${MANUAL_PAUSE}" ]; then
-        log_warn "⚠️  ${caller_name}：手动暂停生效，等待用户执行 rm -f ${MANUAL_PAUSE}"
-    fi
+    local caller_name="$1"
     while [ -f "${PAUSE_MARKER}" ] || [ -f "${MANUAL_PAUSE}" ]; do
+        if [ -f "${MANUAL_PAUSE}" ]; then
+            log_warn "[${caller_name}] 检测到 MANUAL_PAUSE 标记，等待手动恢复 (rm -f ${MANUAL_PAUSE})"
+        else
+            log_info "[${caller_name}] 检测到 PAUSE_MARKER（温度报警），等待GPU冷却..."
+        fi
         sleep 2
     done
 }
 
-# 保存原始命令输出到文件，便于报告生成溯源
-save_raw() {
-    local name="$1"; shift
-    local dest="${RAW_DATA_DIR}/${name}.txt"
-    "$@" > "${dest}" 2>&1 || true
-    log_info "原始输出已保存: ${dest}"
-    echo "${dest}"
-}
-
-# =========================================
-# 0. 安装系统级依赖（wget/curl/git/lspci/python3 等基础工具）
-#   健壮性策略：
-#     1) 先尝试修复 apt/dpkg 损坏状态（如被其他进程锁、配置中断）
-#     2) 检测网络连通性，断网就跳过安装（不 exit）
-#     3) 逐个包安装，避免批量失败；任何失败只告警不终止
-#     4) 编译阶段再判断工具是否真的缺失，缺失则跳过对应测试
-# =========================================
+# ==================== 顺序13: install_system_deps() ====================
 install_system_deps() {
-    log_info "========== 0. 安装系统级依赖工具 =========="
+    log_info "开始检查/安装系统基础依赖"
+    local base_deps=(wget curl git lspci python3 make gcc unzip file ldd)
+    local apt_pkgs=(wget curl git pciutils python3 make gcc unzip file libc-bin)
+    local ok_deps=()
+    local fail_deps=()
 
-    local deps_missing=()
-    command -v wget    &>/dev/null || deps_missing+=("wget")
-    command -v curl    &>/dev/null || deps_missing+=("curl")
-    command -v git     &>/dev/null || deps_missing+=("git")
-    command -v lspci   &>/dev/null || deps_missing+=("pciutils")
-    command -v python3 &>/dev/null || deps_missing+=("python3")
-    command -v make    &>/dev/null || deps_missing+=("make")
-    command -v gcc     &>/dev/null || deps_missing+=("gcc")
-    command -v unzip   &>/dev/null || deps_missing+=("unzip")
-    command -v file    &>/dev/null || deps_missing+=("file")
-    command -v ldd     &>/dev/null || deps_missing+=("libc-bin")
-
-    if [ ${#deps_missing[@]} -eq 0 ]; then
-        log_ok "系统依赖工具已就绪（wget/curl/git/lspci/python3/make/gcc）"
-    else
-        # --- 前置1：修复 dpkg/apt 可能的中断/锁状态（最多3种方式，都失败也不中断）---
-        log_info "自动修复 apt/dpkg 可能的损坏状态..."
-        ( sudo dpkg --configure -a >> "${LOG_FILE}" 2>&1 ) || true
-        ( sudo rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock* ) || true
-        ( sudo fuser -v /var/lib/dpkg/lock-frontend &>/dev/null && sudo killall -9 apt-get apt dpkg 2>/dev/null ) || true
-        sleep 1
-
-        # --- 前置2：判断网络（能否解析 + 连到 Ubuntu 镜像或 NVIDIA）---
-        local net_ok=true
-        if ! check_net_reachable; then
-            net_ok=false
-            log_warn "⚠️  检测不到外网连通性（ping & TCP 均失败），跳过系统依赖自动安装"
-            log_warn "    缺少: ${deps_missing[*]}"
-            log_warn "    连上网后可手动执行: sudo apt update && sudo apt install -y ${deps_missing[*]}"
-            log_warn "    脚本将继续运行，缺失工具对应的测试项会自动跳过"
+    local need_apt=false
+    for i in "${!base_deps[@]}"; do
+        local d="${base_deps[$i]}"
+        if command -v "${d}" >/dev/null 2>&1; then
+            ok_deps+=("${d}")
+        elif dpkg -s "${apt_pkgs[$i]}" >/dev/null 2>&1; then
+            ok_deps+=("${d}")
+        else
+            fail_deps+=("${apt_pkgs[$i]}")
+            need_apt=true
         fi
+    done
 
-        if [ "${net_ok}" = "true" ]; then
-            log_info "缺少依赖: ${deps_missing[*]}，正在逐个安装..."
-            # 先 apt update（用 run_apt_safe 包裹，段错误自动自愈）
-            if ! run_apt_safe "update" "-y"; then
-                log_warn "apt update 失败（源可能离线/或 apt 仍损坏），继续尝试直接安装"
-            fi
-
-            # 逐个安装，每个都独立判断，不因为一个失败影响其他
-            local -a installed_ok=()
-            local -a installed_fail=()
-            for pkg in "${deps_missing[@]}"; do
-                # 用 run_apt_safe 包裹：段错误/SIGSEGV 自动触发 apt_selfcheck_repair
-                if run_apt_safe "install" "-y" "--no-install-recommends" "${pkg}"; then
-                    if command -v "${pkg}" &>/dev/null || dpkg -s "${pkg}" &>/dev/null; then
-                        installed_ok+=("${pkg}")
-                        log_ok "  ✓ ${pkg} 安装完成"
-                    else
-                        installed_fail+=("${pkg}")
-                        log_warn "  ✗ ${pkg} apt返回成功但二进制仍缺失（可能是包名不对应）"
-                    fi
+    if [ "${need_apt}" = "true" ]; then
+        if check_net_reachable; then
+            NET_REACHABLE_CACHED="yes"
+            log_info "网络可达，开始 apt 安装缺失依赖: ${fail_deps[*]}"
+            run_apt_safe update || true
+            for pkg in "${fail_deps[@]}"; do
+                run_apt_safe install -y --no-install-recommends "${pkg}" || true
+                if command -v "${pkg}" >/dev/null 2>&1 || dpkg -s "${pkg}" >/dev/null 2>&1; then
+                    ok_deps+=("${pkg}")
                 else
-                    installed_fail+=("${pkg}")
-                    log_warn "  ✗ ${pkg} 安装失败（详见日志，将跳过该工具对应测试）"
+                    log_warn "依赖 ${pkg} 安装后仍不可用"
                 fi
             done
-
-            if [ ${#installed_ok[@]} -gt 0 ]; then
-                log_ok "成功安装依赖: ${installed_ok[*]}"
-            fi
-            if [ ${#installed_fail[@]} -gt 0 ]; then
-                log_warn "以下依赖安装失败，后续对应测试会自动跳过: ${installed_fail[*]}"
-                log_warn "手动修复命令: sudo apt update && sudo apt install -y ${installed_fail[*]}"
-            fi
-        fi
-    fi
-
-    # build-essential：同样 run_apt_safe
-    if ! dpkg -s build-essential &>/dev/null; then
-        log_info "尝试安装 build-essential（编译环境）..."
-        if run_apt_safe "install" "-y" "--no-install-recommends" "build-essential"; then
-            log_ok "build-essential 安装完成"
         else
-            log_warn "build-essential 安装失败，编译 cuda-samples/gpu-burn 时可能报错（会自动跳过）"
+            NET_REACHABLE_CACHED="no"
+            log_warn "网络不可达，跳过依赖apt安装（后续CUDA/驱动下载也会跳过）"
+            log_info "恢复网络后手动执行: sudo apt-get update && sudo apt-get install -y wget curl git pciutils python3 build-essential unzip"
+        fi
+    else
+        NET_REACHABLE_CACHED="yes"
+    fi
+
+    if ! command -v make >/dev/null 2>&1 || ! command -v gcc >/dev/null 2>&1; then
+        if [ "${NET_REACHABLE_CACHED}" = "yes" ]; then
+            log_info "安装 build-essential (make/gcc/g++)"
+            run_apt_safe update || true
+            run_apt_safe install -y --no-install-recommends build-essential || true
         fi
     fi
+    log_ok "系统基础依赖检查完成（ok=${#ok_deps[@]}）"
 }
 
-# =========================================
-# 1. 系统环境检测
-# =========================================
+# ==================== 顺序14: check_system() ====================
 check_system() {
-    log_info "========== 1. 系统环境检测 =========="
-
-    # 检测Ubuntu版本
+    log_info "===== 系统环境检查 ====="
+    local pretty_name="" version_id=""
     if [ -f /etc/os-release ]; then
-        source /etc/os-release
-        log_info "操作系统: ${PRETTY_NAME}"
-        if [[ "${VERSION_ID}" =~ ^24\. ]]; then
-            log_ok "Ubuntu ${VERSION_ID}（24.x 系列），完全兼容"
-        else
-            log_warn "当前非 Ubuntu 24.x 系列，脚本会尝试继续执行，但不保证完全兼容"
-        fi
+        pretty_name="$(grep -E '^PRETTY_NAME=' /etc/os-release | cut -d= -f2 | tr -d '"')"
+        version_id="$(grep -E '^VERSION_ID=' /etc/os-release | cut -d= -f2 | tr -d '"')"
+    fi
+    log_info "操作系统: ${pretty_name} (VERSION_ID=${version_id})"
+    if echo "${version_id}" | grep -qE '^24\.'; then
+        log_ok "Ubuntu 24.x 完全兼容（最新nvidia-driver-560/570 + CUDA12.6官方支持）"
+    else
+        log_warn "非 Ubuntu 24.x (当前=${version_id})，驱动/CUDA版本可能需手动调整，建议升级到24.04 LTS"
     fi
 
     log_info "内核版本: $(uname -r)"
-    log_info "主机名: $(hostname)"
-    log_info "架构: $(uname -m)"
+    log_info "主机名  : $(hostname)"
+    log_info "架构    : $(uname -m)"
+    save_raw uname_full uname -a
+    save_raw cpu_info  cat /proc/cpuinfo
+    save_raw mem_info  cat /proc/meminfo
 
-    # 检测PCIe GPU设备
-    log_info "扫描PCIe总线上的NVIDIA GPU..."
-    VGA_LIST=$(lspci 2>/dev/null | grep -i nvidia || true)
-    # 记录完整lspci输出（即使没找到GPU也记录，便于判断是lspci命令缺失还是真的没卡）
-    save_raw "lspci_full" lspci 2>/dev/null || true
+    log_info "扫描 PCIe 设备..."
+    save_raw lspci_full lspci -nnvvv
+    local VGA_LIST=""
+    VGA_LIST="$(lspci 2>/dev/null | grep -i nvidia || true)"
     if [ -z "${VGA_LIST}" ]; then
-        log_error "═══════════════════════════════════════════════════════════════"
-        log_error "❌ PCIe 总线上未检测到任何 NVIDIA GPU 设备"
-        log_error "═══════════════════════════════════════════════════════════════"
-        if ! command -v lspci &>/dev/null; then
-            log_error "原因：lspci 命令不存在（pciutils未安装）。"
-            log_error "解决：sudo apt install -y pciutils && sudo update-pciids && 重新运行脚本"
+        if ! command -v lspci >/dev/null 2>&1; then
+            log_error "lspci 命令不存在（pciutils未安装），无法扫描GPU"
+            log_info "手动安装: sudo apt-get install -y pciutils && sudo update-pciids"
+            exit 1
         else
-            log_error "可能原因及排查："
-            log_error "  1) GPU 物理接触 → 关机后重新插拔 GPU，金手指用橡皮擦清洁"
-            log_error "  2) 供电未接 → 检查 PCIe 8pin/12pin 电源线是否插紧"
-            log_error "  3) BIOS 禁用 → 进 BIOS：设置 Above 4G Decoding=Enable, SR-IOV=Disable"
-            log_error "  4) 主板插槽损坏 → 换一个 PCIe x16 插槽测试"
-            log_error "  5) GPU 本身损坏 → 换一张已知正常的 GPU 交叉验证"
+            log_error "===== 未检测到任何 NVIDIA GPU PCIe 设备 ====="
+            log_error "请按以下5条硬件排查（RMA前必做）："
+            echo "  1) 断电拔插GPU：清理金手指（橡皮擦拭）、确认8pin/16pin供电线插紧（SXM检查底座螺丝）"
+            echo "  2) 供电/电源：确认单卡>=300W整机余量，双路EPS12V必须都插，HGX/H800检查背板供电"
+            echo "  3) BIOS设置：Above 4G Decoding=Enable，SR-IOV=Disable，PCIe Gen=Auto/Max，Secure Boot=Disable"
+            echo "  4) 插槽交叉：换主板另一个PCIe x16插槽试，或同槽换另一张已知好卡排除"
+            echo "  5) RMA前置：如果以上都试了仍为0卡，拍主板BIOS版本+PCIe插槽照片+序列号提交RMA"
+            exit 1
         fi
-        log_error "═══════════════════════════════════════════════════════════════"
-        log_error "脚本在此停止（没有 GPU 就没有测试对象）。以上检查完成后重新运行。"
-        exit 1
     fi
-    log_ok "检测到以下PCIe GPU设备："
-    echo "${VGA_LIST}" | tee -a "${LOG_FILE}"
+    log_ok "检测到 $(echo "${VGA_LIST}" | wc -l) 个 NVIDIA PCIe 设备:"
+    echo "${VGA_LIST}" | while read -r line; do
+        log_info "  - ${line}"
+    done
 
-    # 检测IOMMU/ACS（多GPU P2P需要）
-    if [ -d /sys/kernel/iommu_groups ]; then
-        IOMMU_COUNT=$(find /sys/kernel/iommu_groups -type l 2>/dev/null | wc -l)
-        log_info "IOMMU组数量: ${IOMMU_COUNT}"
+    log_info "IOMMU 状态 (影响PCIe直通/SR-IOV):"
+    local iommu_lines
+    iommu_lines="$(dmesg 2>/dev/null | grep -i iommu | tail -5 || true)"
+    if [ -n "${iommu_lines}" ]; then
+        echo "${iommu_lines}" | tee -a "${LOG_FILE}"
+        save_raw dmesg_iommu bash -c "dmesg | grep -i iommu"
+    else
+        log_info "未检测到IOMMU消息（需内核启动参数 intel_iommu=on 或 amd_iommu=on）"
     fi
 }
 
-# =========================================
-# 2. NVIDIA 驱动检测与安装
-#   策略：apt 统一走 run_apt_safe（段错误自动自愈），失败只告警不exit
-# =========================================
+# ==================== 顺序15: check_nvidia_driver() ====================
 check_nvidia_driver() {
-    log_info "========== 2. NVIDIA 驱动检测 =========="
-
-    if command -v nvidia-smi &>/dev/null; then
-        DRIVER_VER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -n1)
-        log_ok "已安装 NVIDIA 驱动版本: ${DRIVER_VER}"
-        save_raw "nvidia_smi_initial" nvidia-smi
+    log_info "===== NVIDIA 驱动检查 ====="
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        local drv_ver
+        drv_ver="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1 || echo unknown)"
+        log_ok "nvidia-smi 已就绪，驱动版本=${drv_ver}"
+        save_raw nvidia_smi_initial nvidia-smi
         return 0
     fi
-
     log_warn "未检测到 nvidia-smi，开始自动安装 NVIDIA 驱动..."
-    log_warn "【提示】如果自动安装失败，可手动执行后重启：sudo ubuntu-drivers autoinstall && sudo reboot"
+    log_info "（若自动失败，手动执行: sudo ubuntu-drivers autoinstall && sudo reboot）"
 
-    # apt 全部走 run_apt_safe，段错误会自动触发 apt_selfcheck_repair
-    run_apt_safe "update" "-y" || true
-    run_apt_safe "install" "-y" "--no-install-recommends" \
-        ubuntu-drivers-common software-properties-common dkms build-essential || true
-
-    # PPA 添加（用子shell包裹，add-apt-repository 不走 run_apt_safe）
-    ( sudo add-apt-repository -y -n ppa:graphics-drivers/ppa >> "${LOG_FILE}" 2>&1 ) || true
-    run_apt_safe "update" "-y" || true
-
-    # 自动安装推荐的驱动（优先选择-server版本用于数据中心GPU）
-    log_info "正在检测推荐驱动版本..."
-    RECOMMENDED=$(ubuntu-drivers devices 2>/dev/null | grep -i "recommended" | awk '{print $3}' | head -n1)
-    if [ -z "${RECOMMENDED}" ]; then
-        RECOMMENDED="nvidia-driver-560-server"  # 默认回退到支持H100/B300的服务器驱动
-    fi
-    log_info "即将安装驱动: ${RECOMMENDED}"
-
-    local drv_ok=false
-    if run_apt_safe "install" "-y" "${RECOMMENDED}" dkms; then
-        drv_ok=true
-    fi
-
-    if [ "${drv_ok}" = "true" ] && command -v nvidia-smi &>/dev/null; then
-        log_ok "NVIDIA 驱动安装成功，建议重启系统后再次运行此脚本"
-        log_warn "提示：部分服务器需在BIOS中禁用Secure Boot才能加载驱动模块"
-    else
-        log_error "驱动自动安装失败（可能原因：apt损坏/源无签名/Secure Boot）"
-        log_error "请手动执行后重启：sudo ubuntu-drivers autoinstall && sudo reboot"
-        log_error "脚本继续运行后续检测，若驱动完全不可用会在 enumerate_gpus 门禁阶段给出明确提示"
-    fi
-}
-
-# =========================================
-# 3. CUDA Toolkit 下载与安装（官方权威测试工具来源）
-#   策略：下载/安装失败只告警不exit，后续测试按需跳过
-# =========================================
-install_cuda_toolkit() {
-    log_info "========== 3. CUDA Toolkit 安装 =========="
-
-    # 检查nvcc是否已存在
-    if command -v nvcc &>/dev/null; then
-        CUDA_VER=$(nvcc --version | grep -oP "release \K[0-9]+\.[0-9]+" | head -n1)
-        log_ok "已安装 CUDA Toolkit 版本: ${CUDA_VER}"
-    else
-        log_info "开始下载并安装 CUDA Toolkit ${CUDA_VERSION}（官方runfile方式，避免驱动冲突）..."
-        log_warn "【提示】CUDA约4GB下载较慢，失败可手动装：wget ${CUDA_URL} && sudo sh ${CUDA_RUNFILE} --silent --toolkit"
-
-        CUDA_RUNFILE="cuda_${CUDA_VERSION}_560.35.05_linux.run"
-        CUDA_URL="https://developer.download.nvidia.com/compute/cuda/${CUDA_VERSION}/local_installers/${CUDA_RUNFILE}"
-
-        if [ ! -f "/tmp/${CUDA_RUNFILE}" ]; then
-            log_info "正在下载 CUDA Toolkit，请耐心等待（约4GB）..."
-            # 用子shell包裹，wget失败不影响主流程
-            if ! ( wget -q --show-progress -O "/tmp/${CUDA_RUNFILE}" "${CUDA_URL}" >> "${LOG_FILE}" 2>&1 ); then
-                log_warn "wget下载失败，尝试apt方式安装cuda-toolkit..."
-                # apt fallback（全部子shell包裹）
-                ( wget -qO /tmp/cuda-keyring.deb \
-                    "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb" \
-                    >> "${LOG_FILE}" 2>&1 ) || true
-                ( sudo dpkg -i /tmp/cuda-keyring.deb >> "${LOG_FILE}" 2>&1 ) || true
-                run_apt_safe "update" "-y" || true
-                run_apt_safe "install" "-y" "cuda-toolkit-${CUDA_VERSION//./-}" || true
-            fi
-        fi
-
-        if [ -f "/tmp/${CUDA_RUNFILE}" ]; then
-            ( chmod +x "/tmp/${CUDA_RUNFILE}" ) || true
-            log_info "正在以静默方式安装 CUDA Toolkit（不装驱动，只装工具链和samples）..."
-            ( sudo "/tmp/${CUDA_RUNFILE}" --silent --toolkit --samples --samplespath=/usr/local/cuda/samples \
-                --override >> "${LOG_FILE}" 2>&1 ) || \
-                log_warn "runfile方式安装有告警，继续检查是否安装成功"
-        fi
-    fi
-
-    # 设置PATH（即使没装上也先设置好，避免后续手动装完立刻生效）
-    export PATH="/usr/local/cuda/bin:${PATH}"
-    export LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH}"
-    ( echo 'export PATH="/usr/local/cuda/bin:$PATH"' | sudo tee /etc/profile.d/cuda.sh >/dev/null ) || true
-    ( echo 'export LD_LIBRARY_PATH="/usr/local/cuda/lib64:$LD_LIBRARY_PATH"' | sudo tee -a /etc/profile.d/cuda.sh >/dev/null ) || true
-
-    # 确认nvcc
-    if command -v nvcc &>/dev/null; then
-        log_ok "CUDA Toolkit 安装完成: $(nvcc --version | grep release | tr -s ' ')"
-    else
-        log_error "CUDA Toolkit 未安装或未找到 nvcc（可能：无网络 / 4GB大文件下载中断）"
-        log_error "后续 cuda-samples 编译、gpu-burn 编译会自动跳过，nvidia-smi/DCGM/ECC/PCIe链路等测试仍可运行"
-        log_error "恢复网络后可手动补装后重跑，或用 --skip-install 参数跳过安装阶段"
-    fi
-
-    # 编译 cuda-samples 中的官方测试工具（nvcc存在才编译）
-    if command -v nvcc &>/dev/null; then
-        compile_cuda_samples
-    else
-        log_warn "nvcc 不可用，跳过 cuda-samples 编译（后续官方测试会用nvidia-smi替代）"
-        # 写一个占位，避免后续 cat cuda_bin_dir.txt 报错
-        echo "${OUTPUT_DIR}/cuda_samples_bin" > "${OUTPUT_DIR}/cuda_bin_dir.txt"
-        mkdir -p "${OUTPUT_DIR}/cuda_samples_bin"
-    fi
-}
-
-compile_cuda_samples() {
-    log_info "编译 CUDA Samples 中的官方权威测试工具..."
-
-    SAMPLES_SRC="/usr/local/cuda/samples"
-    BIN_DIR="${OUTPUT_DIR}/cuda_samples_bin"
-    mkdir -p "${BIN_DIR}"
-
-    # 需要编译的官方测试工具清单
-    local -a targets=(
-        "1_Utilities/deviceQuery"
-        "1_Utilities/bandwidthTest"
-        "1_Utilities/p2pBandwidthLatencyTest"
-        "1_Utilities/topologyQuery"
-        "0_Simple/matrixMul"
-        "5_Simulations/nbody"
-    )
-
-    for target in "${targets[@]}"; do
-        local name=$(basename "${target}")
-        local src_path="${SAMPLES_SRC}/${target}"
-        if [ -d "${src_path}" ]; then
-            log_info "编译: ${name}"
-            if make -C "${src_path}" >> "${LOG_FILE}" 2>&1; then
-                cp "${src_path}/${name}" "${BIN_DIR}/" 2>/dev/null || true
-            fi
-        else
-            # 新版cuda把samples拆分到独立包，尝试用git获取
-            log_warn "samples目录不存在，尝试从GitHub获取..."
-            if [ ! -d "/tmp/cuda-samples" ]; then
-                git clone --depth 1 https://github.com/NVIDIA/cuda-samples.git /tmp/cuda-samples >> "${LOG_FILE}" 2>&1
-            fi
-            src_path="/tmp/cuda-samples/Samples/${target}"
-            if [ -d "${src_path}" ]; then
-                make -C "${src_path}" SMS="" >> "${LOG_FILE}" 2>&1
-                cp "${src_path}/${name}" "${BIN_DIR}/" 2>/dev/null || true
-            fi
-        fi
-    done
-
-    log_ok "可用的测试工具: $(ls -1 "${BIN_DIR}" 2>/dev/null | tr '\n' ', ')"
-    echo "${BIN_DIR}" > "${OUTPUT_DIR}/cuda_bin_dir.txt"
-}
-
-# =========================================
-# 4. NVIDIA DCGM 安装（官方数据中心权威诊断工具）
-#   策略：curl 不存在时跳过 wget 替代 → apt 直接装 → 全部失败只告警
-# =========================================
-install_dcgm() {
-    log_info "========== 4. NVIDIA DCGM 数据中心诊断工具安装 =========="
-
-    if command -v dcgmi &>/dev/null; then
-        log_ok "DCGM 已安装: $(dcgmi --version 2>&1 | head -n1)"
-        return 0
-    fi
-
-    log_info "尝试安装 NVIDIA DCGM（官方数据中心GPU权威诊断工具）..."
-
-    local have_curl=false
-    local have_wget=false
-    command -v curl &>/dev/null && have_curl=true
-    command -v wget &>/dev/null && have_wget=true
-
-    local installed_ok=false
-
-    # 方式A：官方 NVIDIA DCGM 仓库（优先 curl，其次 wget）
-    if [ "${have_curl}" = "true" ] || [ "${have_wget}" = "true" ]; then
-        OS_VER="ubuntu24.04"
-        local gpg_key_added=false
-        if [ "${have_curl}" = "true" ]; then
-            ( curl -s -L --max-time 20 https://nvidia.github.io/DCGM/gpgkey 2>/dev/null | sudo apt-key add - >> "${LOG_FILE}" 2>&1 ) && gpg_key_added=true
-        fi
-        if [ "${gpg_key_added}" = "false" ] && [ "${have_wget}" = "true" ]; then
-            ( wget -q --timeout=20 -O - https://nvidia.github.io/DCGM/gpgkey 2>/dev/null | sudo apt-key add - >> "${LOG_FILE}" 2>&1 ) && gpg_key_added=true
-        fi
-
-        if [ "${gpg_key_added}" = "true" ]; then
-            local list_written=false
-            if [ "${have_curl}" = "true" ]; then
-                ( curl -s -L --max-time 20 "https://nvidia.github.io/DCGM/${OS_VER}/x86_64/DCGM.list" 2>/dev/null | \
-                    sudo tee /etc/apt/sources.list.d/dcgm.list >/dev/null ) && list_written=true
-            fi
-            if [ "${list_written}" = "false" ] && [ "${have_wget}" = "true" ]; then
-                ( wget -q --timeout=20 -O - "https://nvidia.github.io/DCGM/${OS_VER}/x86_64/DCGM.list" 2>/dev/null | \
-                    sudo tee /etc/apt/sources.list.d/dcgm.list >/dev/null ) && list_written=true
-            fi
-
-            if [ "${list_written}" = "true" ]; then
-                ( sudo apt-get update -y >> "${LOG_FILE}" 2>&1 ) || true
-                if ( sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends datacenter-gpu-manager >> "${LOG_FILE}" 2>&1 ); then
-                    installed_ok=true
-                fi
-            fi
-        fi
-    else
-        log_warn "⚠️  curl/wget 均未安装，无法添加 NVIDIA DCGM 仓库"
-    fi
-
-    # 方式B：直接用 apt search 看看有没有现成的 datacenter-gpu-manager（某些系统已带）
-    if [ "${installed_ok}" = "false" ]; then
-        if ( sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends datacenter-gpu-manager >> "${LOG_FILE}" 2>&1 ); then
-            installed_ok=true
-        fi
-    fi
-
-    # 启动DCGM服务（无论哪种方式装上的，都尝试启动）
-    if [ "${installed_ok}" = "true" ] || command -v dcgmi &>/dev/null; then
-        ( sudo systemctl enable --now nvidia-dcgm.service >> "${LOG_FILE}" 2>&1 ) || true
-        sleep 2
-    fi
-
-    if command -v dcgmi &>/dev/null; then
-        log_ok "DCGM 安装并启动成功"
-    else
-        log_warn "DCGM 未安装（可能：无网络 / curl&wget均缺失 / 源不可达）"
-        log_warn "  手动恢复命令（连上网后执行）："
-        log_warn "    sudo apt install -y curl wget && curl -s -L https://nvidia.github.io/DCGM/gpgkey | sudo apt-key add -"
-        log_warn "    curl -s -L https://nvidia.github.io/DCGM/ubuntu24.04/x86_64/DCGM.list | sudo tee /etc/apt/sources.list.d/dcgm.list"
-        log_warn "    sudo apt update && sudo apt install -y datacenter-gpu-manager && sudo systemctl enable --now nvidia-dcgm"
-        log_warn "  当前脚本将使用 nvidia-smi 替代完成诊断（结果稍弱但可用）"
-    fi
-}
-
-# =========================================
-# 4.5 下载编译质检工具
-#   原厂工具（随CUDA Toolkit自带，无需下载）：
-#     - cuda-memcheck: NVIDIA原厂CUDA内存错误检测器（随CUDA Toolkit安装）
-#     - nvbandwidth:  NVIDIA原厂新一代PCIe/NVLink带宽测试工具（较新CUDA版本自带）
-#   第三方补充工具（需下载编译）：
-#     - gpu-burn: 满载烧机+正确性校验（矩阵乘法结果与CPU基准比对）
-#     - cuda_memtest: 显存10种模式主动写入-读出-校验（行业级显存质检标准）
-#   下载策略：git clone → wget zip → curl zip → ghproxy镜像（4层回退）
-# =========================================
-install_factory_tools() {
-    log_info "========== 4.5 质检工具准备 =========="
-
-    local FACTORY_BIN="${OUTPUT_DIR}/factory_tools_bin"
-    mkdir -p "${FACTORY_BIN}"
-    echo "${FACTORY_BIN}" > "${OUTPUT_DIR}/factory_bin_dir.txt"
-
-    export PATH="/usr/local/cuda/bin:${PATH}"
-    export LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH}"
-
-    # 前置判断：连外网 & 有下载工具吗？ 没的话直接跳过下载，不浪费时间
-    local have_downloader=false
-    command -v git &>/dev/null && have_downloader=true
-    command -v wget &>/dev/null && have_downloader=true
-    command -v curl &>/dev/null && have_downloader=true
-
-    local net_reachable=false
-    if [ "${have_downloader}" = "true" ]; then
-        # 优先 ping，再 TCP（和全局 check_net_reachable 一致，避免误判无网）
-        if ping -c 2 -W 3 -q github.com &>/dev/null || \
-           ping -c 2 -W 3 -q mirrors.aliyun.com &>/dev/null || \
-           ( timeout 5 bash -c "exec 3<>/dev/tcp/github.com/443" &>/dev/null ) || \
-           ( timeout 5 bash -c "exec 3<>/dev/tcp/mirrors.aliyun.com/80" &>/dev/null ); then
-            net_reachable=true
-        fi
-    fi
-
-    local skip_download=false
-    if [ "${have_downloader}" = "false" ]; then
-        log_warn "⚠️  curl/wget/git 均未安装，无法下载 gpu-burn / cuda_memtest 源码，已自动跳过下载"
-        skip_download=true
-    elif [ "${net_reachable}" = "false" ]; then
-        log_warn "⚠️  检测不到外网连通性，跳过 gpu-burn / cuda_memtest 下载编译"
-        skip_download=true
-    fi
-    if [ "${skip_download}" = "true" ]; then
-        log_warn "    手动恢复（连网后执行）："
-        log_warn "      sudo apt install -y git wget curl build-essential"
-        log_warn "      然后重跑脚本（加 --skip-install 跳过已完成的安装阶段）"
-        log_warn "    原厂 cuda-memcheck/nvbandwidth 检测将照常执行。"
-    fi
-
-    # ================================================================
-    # 工具1: gpu-burn（满载烧机+正确性校验）
-    # ================================================================
-    local GB_DIR="/tmp/gpu-burn"
-    local gb_ok=false
-
-    # 检查是否已编译好
-    if [ -x "${GB_DIR}/gpu_burn" ]; then
-        cp "${GB_DIR}/gpu_burn" "${FACTORY_BIN}/" 2>/dev/null
-        log_ok "gpu-burn 已存在，直接复用"
-        gb_ok=true
-    fi
-
-    if [ "${gb_ok}" = "false" ] && [ "${skip_download}" = "false" ]; then
-        log_info "[1/2] 下载 gpu-burn ..."
-        rm -rf "${GB_DIR}"
-        mkdir -p "${GB_DIR}"
-
-        # 下载方法1: git clone（官方仓库）
-        log_info "  尝试方法1: git clone (github.com)..."
-        git clone --depth 1 https://github.com/wilicc/gpu-burn.git "${GB_DIR}" >> "${LOG_FILE}" 2>&1
-        local git_ret=$?
-
-        # 下载方法2: git clone via ghproxy镜像
-        if [ ${git_ret} -ne 0 ] || [ ! -f "${GB_DIR}/Makefile" ]; then
-            log_warn "  git clone 失败(ret=${git_ret})，尝试方法2: ghproxy镜像..."
-            rm -rf "${GB_DIR}"
-            git clone --depth 1 https://ghproxy.com/https://github.com/wilicc/gpu-burn.git "${GB_DIR}" >> "${LOG_FILE}" 2>&1
-            git_ret=$?
-        fi
-
-        # 下载方法3: wget 下载zip压缩包
-        if [ ${git_ret} -ne 0 ] || [ ! -f "${GB_DIR}/Makefile" ]; then
-            log_warn "  git clone 失败(ret=${git_ret})，尝试方法3: wget zip..."
-            rm -rf "${GB_DIR}"
-            local gb_zip="/tmp/gpu-burn.zip"
-            wget -q --timeout=60 -O "${gb_zip}" \
-                "https://github.com/wilicc/gpu-burn/archive/refs/heads/master.zip" >> "${LOG_FILE}" 2>&1
-            if [ $? -eq 0 ] && [ -f "${gb_zip}" ] && [ -s "${gb_zip}" ]; then
-                unzip -q -o "${gb_zip}" -d /tmp/ >> "${LOG_FILE}" 2>&1
-                mv /tmp/gpu-burn-master "${GB_DIR}" 2>/dev/null || true
-            else
-                log_warn "  wget zip 失败，尝试方法4: curl via ghproxy..."
-                curl -sL --max-time 60 -o "${gb_zip}" \
-                    "https://ghproxy.com/https://github.com/wilicc/gpu-burn/archive/refs/heads/master.zip" >> "${LOG_FILE}" 2>&1
-                if [ -f "${gb_zip}" ] && [ -s "${gb_zip}" ]; then
-                    unzip -q -o "${gb_zip}" -d /tmp/ >> "${LOG_FILE}" 2>&1
-                    mv /tmp/gpu-burn-master "${GB_DIR}" 2>/dev/null || true
-                fi
-            fi
-        fi
-
-        # 检查源码是否下载成功
-        if [ ! -f "${GB_DIR}/Makefile" ]; then
-            log_error "  gpu-burn 源码下载失败（所有4种方法均失败）"
-            log_error "  请手动下载: https://github.com/wilicc/gpu-burn"
-            log_error "  解压后执行: cd gpu-burn && make CUDA_PATH=/usr/local/cuda"
-            log_error "  然后将 gpu_burn 复制到: ${FACTORY_BIN}/"
-        else
-            log_ok "  gpu-burn 源码下载成功"
-
-            # 修改Makefile指定CUDA路径
-            if grep -q "CUDA_PATH" "${GB_DIR}/Makefile" 2>/dev/null; then
-                sed -i "s|CUDA_PATH?=.*|CUDA_PATH?=/usr/local/cuda|g" "${GB_DIR}/Makefile"
-            else
-                # 某些版本没有CUDA_PATH变量，直接在编译命令里加
-                sed -i "s|nvcc|/usr/local/cuda/bin/nvcc|g" "${GB_DIR}/Makefile" 2>/dev/null || true
-                sed -i "s|-L.*cuda|/usr/local/cuda/lib64|g" "${GB_DIR}/Makefile" 2>/dev/null || true
-            fi
-            # 修复：某些版本用compute.cu需要指定arch
-            export CUDA_PATH="/usr/local/cuda"
-
-            log_info "  开始编译 gpu-burn..."
-            make -C "${GB_DIR}" CUDA_PATH=/usr/local/cuda >> "${LOG_FILE}" 2>&1
-            local make_ret=$?
-
-            if [ ${make_ret} -eq 0 ] && [ -x "${GB_DIR}/gpu_burn" ]; then
-                cp "${GB_DIR}/gpu_burn" "${FACTORY_BIN}/"
-                # 验证二进制能否运行
-                if "${FACTORY_BIN}/gpu_burn" -h &>/dev/null || "${FACTORY_BIN}/gpu_burn" --help &>/dev/null; then
-                    log_ok "  gpu-burn 编译成功并验证通过"
-                    gb_ok=true
-                else
-                    log_warn "  gpu-burn 编译成功但运行验证失败（可能CUDA运行库路径问题）"
-                    log_warn "  尝试设置LD_LIBRARY_PATH后重新验证..."
-                    LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH}" "${FACTORY_BIN}/gpu_burn" -h &>/dev/null && {
-                        log_ok "  gpu-burn 运行验证通过（需设置LD_LIBRARY_PATH）"
-                        gb_ok=true
-                    } || {
-                        log_warn "  gpu-burn 运行验证仍失败，但二进制已保留，将在测试时尝试运行"
-                        gb_ok=true  # 保留二进制，运行时再验证
-                    }
-                fi
-            else
-                log_error "  gpu-burn 编译失败(ret=${make_ret})"
-                log_error "  编译错误日志（最后30行）:"
-                tail -30 "${LOG_FILE}" 2>/dev/null | while read -r line; do log_error "    ${line}"; done
-                log_error "  请检查: 1) nvcc是否安装 2) CUDA头文件路径 3) 依赖库"
-            fi
-        fi
-    fi
-
-    # ================================================================
-    # 工具2: cuda_memtest（显存10种模式主动校验）
-    # ================================================================
-    local CM_DIR="/tmp/cuda_memtest"
-    local cm_ok=false
-
-    # 检查是否已编译好
-    local existing_cm=$(find "${CM_DIR}" -name "cuda_memtest" -type f -executable 2>/dev/null | head -n1)
-    if [ -n "${existing_cm}" ]; then
-        cp "${existing_cm}" "${FACTORY_BIN}/cuda_memtest" 2>/dev/null
-        log_ok "cuda_memtest 已存在，直接复用"
-        cm_ok=true
-    fi
-
-    if [ "${cm_ok}" = "false" ] && [ "${skip_download}" = "false" ]; then
-        log_info "[2/2] 下载 cuda_memtest ..."
-        rm -rf "${CM_DIR}"
-        mkdir -p "${CM_DIR}"
-
-        # 下载方法1: git clone（官方仓库）
-        log_info "  尝试方法1: git clone (github.com)..."
-        git clone --depth 1 https://github.com/ComputationalRadiationPhysics/cuda_memtest.git "${CM_DIR}" >> "${LOG_FILE}" 2>&1
-        local git_ret=$?
-
-        # 下载方法2: git clone via ghproxy镜像
-        if [ ${git_ret} -ne 0 ] || [ ! -f "${CM_DIR}/Makefile" ]; then
-            log_warn "  git clone 失败(ret=${git_ret})，尝试方法2: ghproxy镜像..."
-            rm -rf "${CM_DIR}"
-            git clone --depth 1 https://ghproxy.com/https://github.com/ComputationalRadiationPhysics/cuda_memtest.git "${CM_DIR}" >> "${LOG_FILE}" 2>&1
-            git_ret=$?
-        fi
-
-        # 下载方法3: wget 下载zip压缩包
-        if [ ${git_ret} -ne 0 ] || [ ! -f "${CM_DIR}/Makefile" ]; then
-            log_warn "  git clone 失败(ret=${git_ret})，尝试方法3: wget zip..."
-            rm -rf "${CM_DIR}"
-            local cm_zip="/tmp/cuda_memtest.zip"
-            wget -q --timeout=60 -O "${cm_zip}" \
-                "https://github.com/ComputationalRadiationPhysics/cuda_memtest/archive/refs/heads/master.zip" >> "${LOG_FILE}" 2>&1
-            if [ $? -eq 0 ] && [ -f "${cm_zip}" ] && [ -s "${cm_zip}" ]; then
-                unzip -q -o "${cm_zip}" -d /tmp/ >> "${LOG_FILE}" 2>&1
-                mv /tmp/cuda_memtest-master "${CM_DIR}" 2>/dev/null || true
-            else
-                log_warn "  wget zip 失败，尝试方法4: curl via ghproxy..."
-                curl -sL --max-time 60 -o "${cm_zip}" \
-                    "https://ghproxy.com/https://github.com/ComputationalRadiationPhysics/cuda_memtest/archive/refs/heads/master.zip" >> "${LOG_FILE}" 2>&1
-                if [ -f "${cm_zip}" ] && [ -s "${cm_zip}" ]; then
-                    unzip -q -o "${cm_zip}" -d /tmp/ >> "${LOG_FILE}" 2>&1
-                    mv /tmp/cuda_memtest-master "${CM_DIR}" 2>/dev/null || true
-                fi
-            fi
-        fi
-
-        # 检查源码是否下载成功
-        if [ ! -f "${CM_DIR}/Makefile" ]; then
-            log_error "  cuda_memtest 源码下载失败（所有4种方法均失败）"
-            log_error "  请手动下载: https://github.com/ComputationalRadiationPhysics/cuda_memtest"
-            log_error "  解压后执行: cd cuda_memtest && make CUDA_DIR=/usr/local/cuda"
-            log_error "  然后将 cuda_memtest 复制到: ${FACTORY_BIN}/"
-        else
-            log_ok "  cuda_memtest 源码下载成功"
-
-            # 修改Makefile指定CUDA路径
-            if grep -q "CUDA_DIR" "${CM_DIR}/Makefile" 2>/dev/null; then
-                sed -i "s|CUDA_DIR.*=.*|CUDA_DIR = /usr/local/cuda|g" "${CM_DIR}/Makefile"
-            fi
-            # 修复nvcc路径
-            sed -i "s|/usr/bin/nvcc|/usr/local/cuda/bin/nvcc|g" "${CM_DIR}/Makefile" 2>/dev/null || true
-
-            log_info "  开始编译 cuda_memtest..."
-            make -C "${CM_DIR}" CUDA_DIR=/usr/local/cuda >> "${LOG_FILE}" 2>&1
-            local make_ret=$?
-
-            local cm_bin=""
-            if [ ${make_ret} -eq 0 ]; then
-                cm_bin=$(find "${CM_DIR}" -name "cuda_memtest" -type f -executable 2>/dev/null | head -n1)
-            fi
-
-            if [ -n "${cm_bin}" ]; then
-                cp "${cm_bin}" "${FACTORY_BIN}/cuda_memtest"
-                # 验证二进制能否运行
-                if "${FACTORY_BIN}/cuda_memtest" --help &>/dev/null || "${FACTORY_BIN}/cuda_memtest" 2>&1 | head -5 | grep -qi "usage\|test\|memtest"; then
-                    log_ok "  cuda_memtest 编译成功并验证通过"
-                    cm_ok=true
-                else
-                    log_warn "  cuda_memtest 编译成功但运行验证失败，但二进制已保留"
-                    cm_ok=true
-                fi
-            else
-                log_error "  cuda_memtest 编译失败(ret=${make_ret})"
-                log_error "  编译错误日志（最后30行）:"
-                tail -30 "${LOG_FILE}" 2>/dev/null | while read -r line; do log_error "    ${line}"; done
-                log_error "  请检查: 1) nvcc是否安装 2) CUDA头文件路径 3) 依赖库"
-            fi
-        fi
-    fi
-
-    # ================================================================
-    # 原厂工具检测（随CUDA Toolkit自带，无需下载）
-    # ================================================================
-
-    # cuda-memcheck: NVIDIA原厂CUDA内存错误检测器
-    log_info "检测 NVIDIA 原厂工具..."
-    local CMC_BIN=""
-    # cuda-memcheck 通常在 /usr/local/cuda/bin/ 或 /usr/local/cuda/computeprof/bin/
-    for p in /usr/local/cuda/bin/cuda-memcheck /usr/local/cuda/extras/CUPTI/bin/cuda-memcheck \
-             /usr/local/cuda/computeprof/bin/cuda-memcheck; do
-        if [ -x "${p}" ]; then CMC_BIN="${p}"; break; fi
-    done
-    # 也检查PATH
-    if [ -z "${CMC_BIN}" ]; then
-        CMC_BIN=$(command -v cuda-memcheck 2>/dev/null || true)
-    fi
-    if [ -n "${CMC_BIN}" ]; then
-        cp "${CMC_BIN}" "${FACTORY_BIN}/cuda-memcheck" 2>/dev/null || true
-        log_ok "  [原厂] cuda-memcheck: ✓ 可用 (${CMC_BIN})"
-    else
-        log_warn "  [原厂] cuda-memcheck: ✗ 未找到（应随CUDA Toolkit安装，请检查 /usr/local/cuda/bin/）"
-    fi
-
-    # nvbandwidth: NVIDIA原厂新一代带宽测试工具（CUDA 12.6+自带）
-    local NVBW_BIN=""
-    for p in /usr/local/cuda/bin/nvbandwidth /usr/local/cuda/nvbandwidth; do
-        if [ -x "${p}" ]; then NVBW_BIN="${p}"; break; fi
-    done
-    if [ -z "${NVBW_BIN}" ]; then
-        NVBW_BIN=$(command -v nvbandwidth 2>/dev/null || true)
-    fi
-    # nvbandwidth 可能需要从CUDA samples编译
-    if [ -z "${NVBW_BIN}" ]; then
-        local NVBW_SRC="/usr/local/cuda/nvbandwidth"
-        [ -d "/tmp/cuda-samples/Samples/nvbandwidth" ] && NVBW_SRC="/tmp/cuda-samples/Samples/nvbandwidth"
-        if [ -d "${NVBW_SRC}" ] && [ -f "${NVBW_SRC}/Makefile" ]; then
-            log_info "  编译 nvbandwidth (原厂)..."
-            make -C "${NVBW_SRC}" >> "${LOG_FILE}" 2>&1 || true
-            NVBW_BIN=$(find "${NVBW_SRC}" -name "nvbandwidth" -type f -executable 2>/dev/null | head -n1)
-        fi
-    fi
-    if [ -n "${NVBW_BIN}" ]; then
-        cp "${NVBW_BIN}" "${FACTORY_BIN}/nvbandwidth" 2>/dev/null || true
-        log_ok "  [原厂] nvbandwidth: ✓ 可用 (${NVBW_BIN})"
-    else
-        log_warn "  [原厂] nvbandwidth: ✗ 未找到（较老CUDA版本可能不含，使用bandwidthTest替代）"
-    fi
-
-    # 最终检查
-    log_info "===== 质检工具就绪状态汇总 ====="
-    log_info "--- NVIDIA 原厂工具 ---"
-    if [ -x "${FACTORY_BIN}/cuda-memcheck" ]; then
-        log_ok "  [原厂] cuda-memcheck: ✓ 可用"
-    else
-        log_warn "  [原厂] cuda-memcheck: ✗ 未找到"
-    fi
-    if [ -x "${FACTORY_BIN}/nvbandwidth" ]; then
-        log_ok "  [原厂] nvbandwidth: ✓ 可用"
-    else
-        log_warn "  [原厂] nvbandwidth: ✗ 未找到（用bandwidthTest替代）"
-    fi
-    log_info "--- 第三方补充工具 ---"
-    if [ -x "${FACTORY_BIN}/gpu_burn" ]; then
-        log_ok "  [第三方] gpu_burn: ✓ 可用"
-    else
-        log_warn "  [第三方] gpu_burn: ✗ 不可用（满载烧机正确性校验将跳过）"
-    fi
-    if [ -x "${FACTORY_BIN}/cuda_memtest" ]; then
-        log_ok "  [第三方] cuda_memtest: ✓ 可用"
-    else
-        log_warn "  [第三方] cuda_memtest: ✗ 不可用（显存校验将回退到bandwidthTest）"
-    fi
-}
-
-# =========================================
-# 5. GPU 枚举与基础信息采集（门禁检查）
-# =========================================
-enumerate_gpus() {
-    log_info "========== 5. GPU 设备枚举（可用性门禁） =========="
-
-    GPU_COUNT=$(nvidia-smi --query-gpu=count --format=csv,noheader | head -n1 || echo 0)
-    if [ "${GPU_COUNT}" -eq 0 ] 2>/dev/null; then
-        # 兼容不同驱动版本
-        GPU_COUNT=$(nvidia-smi -L 2>/dev/null | wc -l)
-    fi
-
-    if [ "${GPU_COUNT}" -eq 0 ]; then
-        log_error "═══════════════════════════════════════════════════════════════"
-        log_error "❌ GPU 可用性门禁未通过：nvidia-smi 能看到 GPU 但无法枚举（驱动未正确加载）"
-        log_error "═══════════════════════════════════════════════════════════════"
-        log_error "驱动状态诊断："
-        log_error "  · lsmod 是否加载 nvidia 模块？→ 见下方 lsmod_nvidia.txt"
-        log_error "  · dmesg 中是否有 Xid/错误？   → 见下方 dmesg_nvidia.txt"
-        log_error "  · nvidia-smi -L 原始输出？     → 见下方 nvidia_smi_L.txt"
-        log_error "常见原因及解决："
-        log_error "  1) Secure Boot 拦截 → 进 BIOS 关闭 Secure Boot，重启"
-        log_error "  2) 内核版本不匹配 → sudo apt install linux-headers-\$(uname -r) 后重装驱动"
-        log_error "  3) 驱动未安装完成 → sudo ubuntu-drivers autoinstall，然后 sudo reboot"
-        log_error "  4) 新驱动装了但没重启 → 直接 sudo reboot（装完驱动必重启）"
-        log_error "═══════════════════════════════════════════════════════════════"
-        save_raw "nvidia_smi_L" nvidia-smi -L
-        save_raw "lsmod_nvidia" bash -c "lsmod | grep -i nvidia"
-        save_raw "dmesg_nvidia" bash -c "dmesg | grep -i nvidia | tail -50"
-        exit 1
-    fi
-
-    log_ok "GPU可用性门禁通过，共检测到 ${GPU_COUNT} 块 GPU"
-    echo "${GPU_COUNT}" > "${OUTPUT_DIR}/gpu_count.txt"
-
-    # 输出每块GPU的基础信息
-    nvidia-smi --query-gpu=index,name,pci.bus_id,driver_version,pstate,pcie.link.gen.max,pcie.link.width.max,vbios_version,serial,uuid,compute_mode \
-        --format=csv | tee "${RAW_DATA_DIR}/gpu_basic_info.csv" | tee -a "${LOG_FILE}"
-
-    # 保存详细的 nvidia-smi 输出
-    save_raw "nvidia_smi_full" nvidia-smi -q -x  # XML格式便于解析
-
-    # PCIe 拓扑信息
-    save_raw "nvidia_smi_topology" nvidia-smi topo -m
-}
-
-# =========================================
-# 6. 官方测试一：deviceQuery（CUDA能力全量枚举）
-# =========================================
-test_device_query() {
-    log_info "========== 6. CUDA deviceQuery 官方测试 =========="
-    local bin_dir
-    bin_dir=$(cat "${OUTPUT_DIR}/cuda_bin_dir.txt" 2>/dev/null)
-    if [ -x "${bin_dir}/deviceQuery" ]; then
-        save_raw "deviceQuery" "${bin_dir}/deviceQuery"
-        log_ok "deviceQuery 测试完成"
-    else
-        log_warn "deviceQuery 未编译，使用 nvidia-smi 替代查询"
-    fi
-}
-
-# =========================================
-# 7. PCIe 带宽测试
-#   优先级1 [原厂]: nvbandwidth — NVIDIA新一代带宽测试工具（CUDA 12.6+）
-#   优先级2 [原厂]: bandwidthTest — CUDA Samples经典带宽测试
-# =========================================
-test_bandwidth() {
-    log_info "========== 7. PCIe 带宽测试 =========="
-    local bin_dir
-    bin_dir=$(cat "${OUTPUT_DIR}/cuda_bin_dir.txt" 2>/dev/null)
-    local factory_bin
-    factory_bin=$(cat "${OUTPUT_DIR}/factory_bin_dir.txt" 2>/dev/null)
-    local gpu_count
-    gpu_count=$(cat "${OUTPUT_DIR}/gpu_count.txt")
-
-    # 优先级1: 原厂 nvbandwidth（新一代）
-    if [ -x "${factory_bin}/nvbandwidth" ]; then
-        for (( i=0; i<gpu_count; i++ )); do
-            log_info "GPU ${i}: [原厂] nvbandwidth 带宽测试..."
-            CUDA_VISIBLE_DEVICES=${i} save_raw "nvbandwidth_gpu${i}" \
-                "${factory_bin}/nvbandwidth"
-        done
-        log_ok "[原厂] nvbandwidth 带宽测试完成"
-    fi
-
-    # 优先级2: 原厂 bandwidthTest（经典）
-    if [ -x "${bin_dir}/bandwidthTest" ]; then
-        for (( i=0; i<gpu_count; i++ )); do
-            log_info "GPU ${i}: [原厂] bandwidthTest PCIe带宽测试..."
-            CUDA_VISIBLE_DEVICES=${i} save_raw "bandwidthTest_gpu${i}" \
-                "${bin_dir}/bandwidthTest" --device=${i} --memory=pinned --mode=range --csv
-        done
-        log_ok "[原厂] bandwidthTest 带宽测试完成（结果包含 H2D/D2H/D2D）"
-    else
-        log_warn "bandwidthTest 不可用，跳过PCIe带宽测试"
-    fi
-}
-
-# =========================================
-# 8. 官方测试三：p2pBandwidthLatencyTest（多GPU P2P通信）
-# =========================================
-test_p2p() {
-    log_info "========== 8. 多GPU P2P 带宽/延迟测试（官方 p2pBandwidthLatencyTest） =========="
-    local bin_dir
-    bin_dir=$(cat "${OUTPUT_DIR}/cuda_bin_dir.txt" 2>/dev/null)
-    local gpu_count
-    gpu_count=$(cat "${OUTPUT_DIR}/gpu_count.txt")
-
-    if [ "${gpu_count}" -lt 2 ]; then
-        log_info "单GPU系统，跳过P2P测试"
-        return
-    fi
-
-    if [ -x "${bin_dir}/p2pBandwidthLatencyTest" ]; then
-        save_raw "p2pBandwidthLatencyTest" "${bin_dir}/p2pBandwidthLatencyTest"
-
-        # topologyQuery 辅助诊断拓扑
-        if [ -x "${bin_dir}/topologyQuery" ]; then
-            save_raw "topologyQuery" "${bin_dir}/topologyQuery"
-        fi
-        log_ok "P2P测试完成（含带宽/延迟矩阵）"
-    else
-        log_warn "p2pBandwidthLatencyTest 不可用，使用 nvidia-smi topo 替代"
-        save_raw "nvidia_smi_p2p" nvidia-smi p2p -s 2>/dev/null || true
-    fi
-}
-
-# =========================================
-# 9. CUDA 计算性能基准：nbody + matrixMul（官方）
-# =========================================
-test_cuda_perf() {
-    log_info "========== 9. CUDA 计算性能基准测试 =========="
-    local bin_dir
-    bin_dir=$(cat "${OUTPUT_DIR}/cuda_bin_dir.txt" 2>/dev/null)
-    local gpu_count
-    gpu_count=$(cat "${OUTPUT_DIR}/gpu_count.txt")
-
-    for (( i=0; i<gpu_count; i++ )); do
-        # nbody 模拟（衡量FP32/FP64算力）
-        if [ -x "${bin_dir}/nbody" ]; then
-            log_info "GPU ${i}: 运行 nbody 计算性能基准..."
-            CUDA_VISIBLE_DEVICES=${i} save_raw "nbody_gpu${i}" \
-                "${bin_dir}/nbody" -benchmark -fp64 -n=16384
-            CUDA_VISIBLE_DEVICES=${i} save_raw "nbody_fp32_gpu${i}" \
-                "${bin_dir}/nbody" -benchmark -fp32 -n=32768
-        fi
-
-        # matrixMul 矩阵乘法基准
-        if [ -x "${bin_dir}/matrixMul" ]; then
-            log_info "GPU ${i}: 运行 matrixMul 矩阵乘法基准..."
-            CUDA_VISIBLE_DEVICES=${i} save_raw "matrixMul_gpu${i}" "${bin_dir}/matrixMul" -wA=1024 -hA=1024 -wB=1024 -hB=1024
-        fi
-    done
-    log_ok "CUDA计算性能基准测试完成"
-}
-
-# =========================================
-# 10. 温度/功耗/稳定性压力测试（售后服务核心项）
-# =========================================
-test_stress_thermal() {
-    wait_for_ready "nbody满载压力测试"
-    log_info "========== 10. 温度/功耗/稳定性压力测试（${STRESS_DURATION_SEC}秒） =========="
-    local bin_dir
-    bin_dir=$(cat "${OUTPUT_DIR}/cuda_bin_dir.txt" 2>/dev/null)
-    local gpu_count
-    gpu_count=$(cat "${OUTPUT_DIR}/gpu_count.txt")
-
-    # 启动后台监控（每秒采样一次温度/功耗/风扇/显存）
-    log_info "启动 nvidia-smi 后台监控（每秒采样）..."
-    nvidia-smi --query-gpu=timestamp,index,name,temperature.gpu,power.draw,fan.speed,utilization.gpu,utilization.memory,memory.used,memory.total,clocks.current.graphics,clocks.current.memory,pstate \
-        --format=csv -l 1 -f "${RAW_DATA_DIR}/gpu_monitor_during_stress.csv" &
-    MONITOR_PID=$!
-
-    # 启动压力负载（每个GPU跑nbody大负载持续指定时长）
-    local -a stress_pids=()
-    if [ -x "${bin_dir}/nbody" ]; then
-        for (( i=0; i<gpu_count; i++ )); do
-            log_info "GPU ${i}: 启动压力负载（${STRESS_DURATION_SEC}秒）..."
-            (
-                timeout "${STRESS_DURATION_SEC}" "${bin_dir}/nbody" \
-                    -benchmark -fp32 -n=65536 -numDevices=1 -device=${i} -iterations=99999999 \
-                    > "${RAW_DATA_DIR}/stress_nbody_gpu${i}.log" 2>&1
-            ) &
-            stress_pids+=($!)
-        done
-    else
-        # fallback: 使用gpu-burn或自己的简单CUDA负载，这里用nvidia-smi dmon监控空转
-        log_warn "nbody不可用，使用轻量级监控模式"
-        sleep "${STRESS_DURATION_SEC}"
-    fi
-
-    # 等待所有压力进程结束（加上超时保护）
-    local max_wait=$((STRESS_DURATION_SEC + 60))
-    local waited=0
-    while [ ${waited} -lt ${max_wait} ]; do
-        local all_done=1
-        for pid in "${stress_pids[@]}"; do
-            if kill -0 "${pid}" 2>/dev/null; then all_done=0; break; fi
-        done
-        [ ${all_done} -eq 1 ] && break
-        sleep 2; waited=$((waited + 2))
-    done
-
-    # 停止监控
-    kill "${MONITOR_PID}" 2>/dev/null; wait "${MONITOR_PID}" 2>/dev/null
-
-    # 分析温度/功耗结果
-    log_info "压力测试完成，分析温度数据..."
-    python3 - <<'PYEOF' >> "${LOG_FILE}" 2>&1
-import csv, json, os
-csv_path = os.environ.get('CSV_PATH')
-if os.path.exists(csv_path):
-    with open(csv_path) as f:
-        reader = csv.DictReader(f)
-        rows = list(reader)
-    if rows:
-        gpus = {}
-        for r in rows:
-            idx = r.get(' index', r.get('index', '0')).strip()
-            gpus.setdefault(idx, {'temps': [], 'powers': [], 'fans': []})
-            for key, field in [('temps', ' temperature.gpu'), ('powers', ' power.draw [W]'), ('fans', ' fan.speed [%]')]:
-                val = r.get(field)
-                if val and 'N/A' not in val:
-                    try:
-                        num = float(''.join(c for c in val if c.isdigit() or c in '.-'))
-                        gpus[idx][key].append(num)
-                    except: pass
-        print("=== 压力测试温度/功耗摘要 ===")
-        for idx, data in sorted(gpus.items()):
-            t = data['temps']; p = data['powers']
-            print(f"GPU {idx}: 温度 MIN/AVG/MAX = {min(t):.1f}/{sum(t)/len(t):.1f}/{max(t):.1f} C" if t else f"GPU {idx}: 温度无数据")
-            print(f"GPU {idx}: 功耗 MIN/AVG/MAX = {min(p):.1f}/{sum(p)/len(p):.1f}/{max(p):.1f} W" if p else f"GPU {idx}: 功耗无数据")
-PYEOF
-    CSV_PATH="${RAW_DATA_DIR}/gpu_monitor_during_stress.csv" python3 - <<'PYEOF'
-import csv, os
-csv_path = os.environ['CSV_PATH']
-if os.path.exists(csv_path):
-    with open(csv_path) as f:
-        reader = csv.DictReader(f)
-        rows = list(reader)
-    gpus = {}
-    for r in rows:
-        idx = list(r.values())[1].strip() if len(list(r.values()))>1 else '0'
-        gpus.setdefault(idx, [])
-        try:
-            t = float([v for k,v in r.items() if 'temp' in k.lower()][0].split()[0])
-            gpus[idx].append(t)
-        except: pass
-    print("=== 温度摘要（简化解析）===")
-    for idx, temps in sorted(gpus.items()):
-        if temps:
-            print(f"GPU {idx}: MIN {min(temps):.1f}C / AVG {sum(temps)/len(temps):.1f}C / MAX {max(temps):.1f}C")
-PYEOF
-
-    # 保存压力测试前后的 nvidia-smi
-    save_raw "nvidia_smi_after_stress" nvidia-smi
-
-    log_ok "温度/功耗/稳定性压力测试完成"
-}
-
-# =========================================
-# 11. DCGM 诊断（如果可用）—— 官方数据中心级完整测试
-# =========================================
-test_dcgm() {
-    log_info "========== 11. NVIDIA DCGM 官方数据中心诊断 =========="
-    if ! command -v dcgmi &>/dev/null; then
-        log_warn "DCGM 不可用，跳过（消费级GPU正常现象）"
-        return
-    fi
-
-    # 运行完整诊断（包含PCIe、显存、计算单元）
-    log_info "运行 dcgmi diag -r 3（Level 3 完整诊断，最权威）..."
-    save_raw "dcgmi_diag_full" bash -c "dcgmi diag -r 3 || true"
-
-    # 健康状态
-    save_raw "dcgmi_health" bash -c "dcgmi health -g all -c || true"
-
-    # 各GPU详细统计（PCIe重放、ECC错误、Xid错误等）
-    save_raw "dcgmi_stats" bash -c "dcgmi stats -g all -v || true"
-
-    # 字段组枚举（支持的所有监控指标）
-    save_raw "dcgmi_fieldgroups" bash -c "dcgmi discovery -l || true"
-
-    log_ok "DCGM 完整诊断完成"
-}
-
-# =========================================
-# 11.5 NVIDIA fieldiag 原厂现场诊断（Field Diagnostics）
-#   fieldiag 是 NVIDIA 原厂现场工程师专用诊断工具，
-#   比dcgmi diag更深入，覆盖存储/计算/PCIe/NVLink全子系统。
-#   该工具通过NVIDIA企业合作伙伴渠道获取，不公开下载。
-#   脚本自动检测常见安装路径，找不到时输出获取指引。
-# =========================================
-test_fieldiag() {
-    log_info "========== 11.5 NVIDIA fieldiag 原厂现场诊断（Level ${FIELD_LEVEL}） =========="
-
-    # 搜索 fieldiag 二进制（常见安装路径）
-    local fieldiag_bin=""
-    for p in \
-        /usr/local/cuda/bin/fieldiag \
-        /usr/local/cuda/bin/nvidia-fieldiag \
-        /opt/nvidia/fieldiag \
-        /opt/nvidia/fieldiag/bin/fieldiag \
-        /usr/bin/fieldiag \
-        /usr/bin/nvidia-fieldiag \
-        "${SCRIPT_DIR}/fieldiag" \
-        "${SCRIPT_DIR}/tools/fieldiag"
-    do
-        if [ -x "${p}" ]; then fieldiag_bin="${p}"; break; fi
-    done
-    # 也搜索PATH
-    if [ -z "${fieldiag_bin}" ]; then
-        fieldiag_bin=$(command -v fieldiag 2>/dev/null || command -v nvidia-fieldiag 2>/dev/null || true)
-    fi
-
-    if [ -z "${fieldiag_bin}" ]; then
-        log_info "fieldiag 二进制未找到，直接跳过原厂现场诊断（不影响其他测试）"
-        # 写入结果标记，报告生成器会识别（不显示冗长下载提示，避免用户困惑）
-        echo "NOT_INSTALLED" > "${RAW_DATA_DIR}/fieldiag_result.txt"
-        {
-            echo "fieldiag 二进制未找到，Level ${FIELD_LEVEL} 诊断已自动跳过"
-            echo "说明：PCIe/温度/ECC/显存/带宽/DCGM/dcgmi diag 等其余测试仍完整执行，售后检测结论仍然权威可靠"
-        } > "${RAW_DATA_DIR}/fieldiag_diag.txt"
-        return
-    fi
-
-    log_ok "找到 fieldiag: ${fieldiag_bin}"
-
-    # 【强制模式】--force-fieldiag：完全跳过预检0~6，直接进入正式诊断
-    # 仅在确认 fieldiag 版本和GPU完全匹配时使用
-    if [ "${FORCE_FIELDIAG}" = "true" ]; then
-        log_warn "⚠️  --force-fieldiag 模式：跳过全部预检（GPU产品线/30秒快速预检/二进制兼容）"
-        log_warn "⚠️  如 fieldiag 版本与GPU不匹配，可能卡死数小时，请耐心等待或 Ctrl+C 终止"
-        log_info "ℹ️  直接进入 Level ${FIELD_LEVEL} 正式诊断..."
-        # 写入基础文件占位，避免报告缺字段
-        echo "FORCE" > "${RAW_DATA_DIR}/fieldiag_precheck.txt"
-        "$fieldiag_bin" --version > "${RAW_DATA_DIR}/fieldiag_version.txt" 2>&1 || true
-        ldd "${fieldiag_bin}" > "${RAW_DATA_DIR}/fieldiag_ldd.txt" 2>&1 || true
-    else
-
-    # ================================================================
-    # 预检0：GPU产品线过滤 —— 消费级GPU（RTX/GTX/TITAN 等）直接跳过，不浪费时间
-    #   fieldiag 官方仅支持数据中心 GPU：Tesla / HGX / DGX 系列
-    #   消费级GPU会直接报 UNSUPPORTED GPU FAMILY 并卡死
-    # ================================================================
-    log_info "预检0：GPU产品线识别（判断是否适合跑fieldiag）..."
-    local gpu_names=""
-    if command -v nvidia-smi &>/dev/null; then
-        gpu_names=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || true)
-    fi
-    local supported_gpu=true
-    local unsupported_reason=""
-    local unsupported_gpus=""
-
-    if [ -z "${gpu_names}" ]; then
-        log_warn "  无法获取GPU名称（nvidia-smi不可用），假设不支持fieldiag，为稳妥起见直接跳过"
-        supported_gpu=false
-        unsupported_reason="nvidia-smi不可用，无法确认GPU产品线"
-    else
-        # 逐GPU判断，全部支持才跑；任何一块不支持就整体跳过（避免混合场景卡死）
-        local gpu_idx=0
-        while IFS= read -r gpu_name; do
-            [ -z "${gpu_name}" ] && continue
-            # fieldiag官方支持的数据中心GPU关键字（白名单）
-            if echo "${gpu_name}" | grep -qiE "(H100|H200|H800|H900|B200|B300|B380|B390|GB200|GB300|A100|A800|A900|A30|A10|A10G|T4|T4g|L4|L40|L40S|V100|V100S|P100|P40|P4|K80|K40|M60|M40|A2|L20|L2|L10|L10G|PG500|PG506|PG509|HGX|DGX|Tesla|GRID|Quadro (RTX|GV100|GP100))"; then
-                log_info "  GPU ${gpu_idx}: [✓ 数据中心支持] ${gpu_name}"
-            else
-                # 消费级/半专业级（黑名单）
-                log_warn "  GPU ${gpu_idx}: [✗ 消费级/非官方支持] ${gpu_name} → fieldiag对此GPU很可能报 UNSUPPORTED GPU FAMILY"
-                supported_gpu=false
-                unsupported_gpus="${unsupported_gpus} ${gpu_name};"
-            fi
-            gpu_idx=$((gpu_idx + 1))
-        done <<< "${gpu_names}"
-
-        if [ "${supported_gpu}" = "false" ]; then
-            unsupported_reason="检测到消费级/非数据中心GPU: ${unsupported_gpus}"
-        fi
-    fi
-
-    if [ "${supported_gpu}" = "false" ]; then
-        log_warn "⚠️ 检测到非数据中心GPU，为避免 fieldiag 卡死，自动跳过原厂现场诊断"
-        log_warn "原因: ${unsupported_reason}"
-        log_info "ℹ️ 消费级GPU PCIe插槽检测已由脚本内置的8层公开工具完整覆盖（lspci+nvidia-smi+bandwidthTest+压力监控），结论同等权威"
-        # 写入结果标记，报告显示：消费级GPU跳过（不算FAIL，也不算未安装）
-        echo "CONSUMER_GPU_SKIPPED" > "${RAW_DATA_DIR}/fieldiag_result.txt"
-        {
-            echo "fieldiag 未运行：检测到消费级/非数据中心GPU"
-            echo "GPU列表:"
-            echo "${gpu_names:-未获取到}"
-            echo "原因: ${unsupported_reason}"
-            echo ""
-            echo "消费级GPU PCIe插槽替代方案（脚本已自动执行，无需fieldiag）:"
-            echo "  1. lspci PCIe枚举 → 识别插槽物理接触问题"
-            echo "  2. nvidia-smi + lspci -vvv → 当前链路规格/最大规格/重放计数"
-            echo "  3. bandwidthTest 原厂 → H2D/D2H/D2D带宽实测"
-            echo "  4. bandwidthTest --mode=shmoo → 扫频边际稳定性"
-            echo "  5. nvidia-smi -l 1 压力监控 → 满载时链路不降速"
-        } > "${RAW_DATA_DIR}/fieldiag_diag.txt"
-        echo "N/A（消费级GPU跳过）" > "${RAW_DATA_DIR}/fieldiag_level.txt"
-        return
-    fi
-    log_ok "  全部GPU为数据中心系列（fieldiag官方支持），继续后续自检"
-
-    # ================================================================
-    # fieldiag 二进制兼容性自检（从20.04拷到24.04的常见问题）
-    #   检查项（预检0之后，预检30s预检之前）:
-    #     1. ELF架构是否匹配（x86_64 vs aarch64）
-    #     2. 可执行权限
-    #     3. 共享库依赖（ldd 全 resolvable，缺 libcuda.so.1/DCGM 库最常见）
-    #     4. --version 能否正常返回（glibc/ABI 兼容性）
-    #     5. GPU架构支持（Hopper/Blackwell/H200/B300需要较新的fieldiag）
-    # ================================================================
-    log_info "fieldiag 兼容性自检（跨系统拷贝后必跑）..."
-    local compat_ok=true
-
-    # [1] ELF架构检查
-    local elf_arch=""
-    elf_arch=$(file -b "${fieldiag_bin}" 2>/dev/null | head -n1)
-    local host_arch=""
-    host_arch=$(uname -m)
-    log_info "  [1/6] ELF架构: ${elf_arch} (主机: ${host_arch})"
-    if echo "${elf_arch}" | grep -qi "${host_arch}"; then
-        log_ok "    架构匹配"
-    else
-        log_error "    ❌ 架构不匹配！fieldiag 是 ${elf_arch}，主机是 ${host_arch}"
-        compat_ok=false
-    fi
-
-    # [2] 可执行权限（某些文件系统拷贝后权限丢失）
-    log_info "  [2/6] 可执行权限..."
-    if [ -x "${fieldiag_bin}" ]; then
-        log_ok "    ✓ 已有执行权限"
-    else
-        log_warn "    ✗ 无执行权限，自动 chmod +x..."
-        chmod +x "${fieldiag_bin}" 2>/dev/null || {
-            log_error "    ❌ chmod +x 失败（权限不足或文件系统为noexec挂载）"
-            compat_ok=false
-        }
-    fi
-
-    # [3] 共享库依赖检查（ldd）
-    log_info "  [3/6] 共享库依赖检查..."
-    local ldd_out=""
-    ldd_out=$(ldd "${fieldiag_bin}" 2>&1)
-    local missing_libs=""
-    missing_libs=$(echo "${ldd_out}" | grep -i "not found\|无法找到\|未找到" 2>/dev/null || true)
-    if [ -z "${missing_libs}" ]; then
-        log_ok "    ✓ 所有依赖库已解析"
-    else
-        log_error "    ❌ 缺少以下依赖库（从20.04拷到24.04常见情况）:"
-        while IFS= read -r line; do
-            log_error "        ${line}"
-        done <<< "${missing_libs}"
-        # 常见缺库修复指引
-        if echo "${missing_libs}" | grep -qi "libcuda"; then
-            log_warn "      缺 libcuda.so.1 → NVIDIA 驱动未安装或未加载，先跑脚本安装驱动后再试"
-        fi
-        if echo "${missing_libs}" | grep -qi "dcgm\|nvidia-ml"; then
-            log_warn "      缺 DCGM/nvidia-ml → 脚本的 install_dcgm() 会安装，或手动 apt install datacenter-gpu-manager"
-        fi
-        if echo "${missing_libs}" | grep -qi "libc\.so"; then
-            log_warn "      缺 glibc 特定版本 → 20.04是glibc 2.31，24.04是glibc 2.39"
-            log_warn "        解决方式: 从 24.04 配套的 CUDA Toolkit/Driver 重新获取 fieldiag 版本"
-        fi
-        compat_ok=false
-    fi
-    # 保存 ldd 供报告查看
-    echo "${ldd_out}" > "${RAW_DATA_DIR}/fieldiag_ldd.txt"
-
-    # [4] --version / --help 能否正常返回（glibc ABI 兼容性最终验证）
-    log_info "  [4/6] glibc ABI 兼容性验证（运行 fieldiag --version）..."
-    local ver_out=""
-    local ver_ret=0
-    ver_out=$("${fieldiag_bin}" --version 2>&1) || ver_ret=$?
-    if [ ${ver_ret} -eq 0 ] || [ ${ver_ret} -eq 1 ]; then
-        # 某些版本 --version 正常返回 0，有些 --version 不支持返回 1（但至少有输出）
-        log_ok "    ✓ fieldiag --version 可运行 (输出: $(echo "${ver_out}" | head -n1))"
-        echo "${ver_out}" > "${RAW_DATA_DIR}/fieldiag_version.txt"
-    else
-        log_error "    ❌ fieldiag --version 运行失败 (返回码=${ver_ret})"
-        log_error "        输出: $(echo "${ver_out}" | head -n5)"
-        # 典型错误：/lib64/ld-linux-x86-64.so.2: bad ELF interpreter / segmentation fault
-        if echo "${ver_out}" | grep -qi "bad ELF interpreter\|No such file or directory"; then
-            log_error "      原因: glibc 加载器路径差异（20.04 vs 24.04 loader路径不同）"
-            log_error "      解决: 从24.04配套的CUDA包中重新获取fieldiag，或安装compat-glibc"
-        fi
-        if echo "${ver_out}" | grep -qi "segmentation fault\|段错误"; then
-            log_error "      原因: 段错误，ABI不兼容或依赖库版本不匹配"
-            log_error "      解决: 使用与当前24.04驱动/CUDA版本匹配的fieldiag"
-        fi
-        compat_ok=false
-    fi
-
-    # [5] GPU架构支持检查（fieldiag版本过老不支持Hopper/Blackwell）
-    log_info "  [5/6] GPU 架构支持检查..."
-    log_info "    当前服务器GPU: ${gpu_names}"
-    # 检查H200/H100/B300等较新的架构是否存在
-    if echo "${gpu_names}" | grep -qiE "H200|H100|B300|B200|Blackwell|Hopper|GB200|L40S|H800"; then
-        log_warn "    检测到 Hopper/Blackwell/L40S 架构（H200/H100/B200/B300/L40S/H800）"
-        log_warn "    如果是较旧的 fieldiag（2023年前版本）可能不支持上述GPU诊断"
-        log_warn "    如果实际诊断报 GPU Unsupported，需升级 fieldiag 版本"
-    fi
-
-    # [6] 30秒快速预检 —— 跑 discovery/help 验证 fieldiag 能初始化并识别GPU（防止正式诊断卡死）
-    log_info "  [6/6] 30秒快速预检（fieldiag discovery/help 初始化验证）..."
-    local precheck_out=""
-    local precheck_ret=0
-    # 尝试多种预检命令（不同版本fieldiag参数不同）
-    timeout 30 bash -c "'${fieldiag_bin}' --list 2>&1 || '${fieldiag_bin}' -l 2>&1 || '${fieldiag_bin}' --discovery 2>&1 || '${fieldiag_bin}' --help 2>&1 | head -50" \
-        > "${RAW_DATA_DIR}/fieldiag_precheck.txt" 2>&1 || precheck_ret=$?
-    precheck_out=$(cat "${RAW_DATA_DIR}/fieldiag_precheck.txt")
-    if [ ${precheck_ret} -eq 0 ] || [ ${precheck_ret} -eq 1 ]; then
-        # 只要不是超时就好。检查有没有致命不支持提示
-        if echo "${precheck_out}" | grep -qiE "UNSUPPORTED|unsupported GPU|not supported|GPU family"; then
-            log_error "    ❌ 30秒预检报 GPU 不支持：${precheck_out}"
-            log_error "      即使是数据中心GPU，此 fieldiag 版本可能仍不支持最新架构，需升级 fieldiag"
-            compat_ok=false
-        elif echo "${precheck_out}" | grep -qiE "fail|error"; then
-            log_warn "    ⚠️ 30秒预检含错误输出，但仍可尝试运行（可手动检查 raw_data/fieldiag_precheck.txt）"
-            log_ok "    30秒预检通过：fieldiag可初始化"
-        else
-            log_ok "    30秒预检通过：fieldiag可初始化（前3行：$(echo "${precheck_out}" | head -n3 | tr '\n' '|'))"
-        fi
-    elif [ ${precheck_ret} -eq 124 ]; then
-        log_error "    ❌ 30秒预检超时（fieldiag 初始化阶段卡死，正式诊断大概率也会卡死）"
-        compat_ok=false
-    else
-        log_warn "    ⚠️ 30秒预检返回码=${precheck_ret}，可继续尝试"
-    fi
-
-    # 最终判定
-    if [ "${compat_ok}" = "true" ]; then
-        log_ok "fieldiag 兼容性自检 ✓ 全部通过，可以直接运行"
-    else
-        log_error "fieldiag 兼容性自检 ❌ 未通过"
-        log_error "处理方式（按优先级）："
-        log_error "  1. 【推荐】从与 Ubuntu 24.04 配套的 CUDA ${CUDA_VERSION} Toolkit 重新获取 fieldiag（版本匹配）"
-        log_error "  2. 安装缺失的依赖库：apt install libnvidia-ml-dev datacenter-gpu-manager"
-        log_error "  3. glibc 不兼容 → 只能用与目标系统匹配的 fieldiag 版本（静态编译版无此问题）"
-        log_error "  4. 在原20.04服务器上运行 ldd fieldiag 查看完整依赖列表"
-        log_error "  5. 30秒预检卡死/超时 → GPU架构版本不匹配，升级fieldiag"
-        # 仍然写入结果
-        echo "INCOMPATIBLE" > "${RAW_DATA_DIR}/fieldiag_result.txt"
-        {
-            echo "fieldiag 二进制兼容性自检失败"
-            echo "架构: ${elf_arch} (主机: ${host_arch})"
-            echo "缺失库:"
-            echo "${missing_libs:-无}"
-            echo "版本测试输出:"
-            echo "${ver_out:-无}"
-            echo "30秒预检输出:"
-            echo "${precheck_out:-无}"
-        } > "${RAW_DATA_DIR}/fieldiag_diag.txt"
-        return
-    fi
-
-    fi   # <-- 结束 FORCE_FIELDIAG 的 else 分支
-
-    wait_for_ready "fieldiag Level ${FIELD_LEVEL} 原厂现场诊断"
-
-    # 根据 FIELD_LEVEL 确定参数和超时
-    local fieldiag_args=""
-    local fieldiag_timeout=21600
-    local test_level_desc=""
-
-    case "${FIELD_LEVEL}" in
-        1)
-            log_info "Field Diagnostics 级别: 1（快速测试）"
-            log_info "预计耗时: 约 5~15 分钟"
-            # 不同版本fieldiag参数兼容
-            if "${fieldiag_bin}" --help 2>&1 | grep -q -- "--level1"; then
-                fieldiag_args="--no_bmc --level1"
-            elif "${fieldiag_bin}" --help 2>&1 | grep -q -- "--field"; then
-                fieldiag_args="--field --quick"
-            else
-                fieldiag_args="p0only device=1"
-            fi
-            fieldiag_timeout=1800
-            test_level_desc="Level 1 (快速)"
-            ;;
-        2)
-            log_info "Field Diagnostics 级别: 2（中等深度）"
-            log_info "预计耗时: 约 4 小时"
-            if "${fieldiag_bin}" --help 2>&1 | grep -q -- "--level2"; then
-                fieldiag_args="--no_bmc --level2"
-            elif "${fieldiag_bin}" --help 2>&1 | grep -q -- "--field"; then
-                fieldiag_args="--field"
-            else
-                fieldiag_args="p0only"
-            fi
-            fieldiag_timeout=14400
-            test_level_desc="Level 2 (中等)"
-            ;;
-        3)
-            log_info "Field Diagnostics 级别: 3（完整诊断）"
-            log_info "预计耗时: 约 6 小时"
-            if "${fieldiag_bin}" --help 2>&1 | grep -q -- "--level3"; then
-                fieldiag_args="--no_bmc --level3"
-            else
-                fieldiag_args=""
-            fi
-            fieldiag_timeout=21600
-            test_level_desc="Level 3 (完整)"
-            ;;
-        *)
-            log_warn "未知 FIELD_LEVEL=${FIELD_LEVEL}，使用默认 Level 2"
-            FIELD_LEVEL=2
-            fieldiag_args="--no_bmc --level2"
-            fieldiag_timeout=14400
-            test_level_desc="Level 2 (中等, 默认)"
-            ;;
-    esac
-
-    # 保存级别信息
-    echo "${test_level_desc}" > "${RAW_DATA_DIR}/fieldiag_level.txt"
-
-    # 启动后台温度监控（长时间诊断必须监控温度）
-    log_info "启动 nvidia-smi 后台监控（fieldiag 诊断期间）..."
-    nvidia-smi --query-gpu=timestamp,index,name,temperature.gpu,power.draw,utilization.gpu,memory.used \
-        --format=csv -l 5 -f "${RAW_DATA_DIR}/gpu_monitor_fieldiag.csv" &
-    local monitor_pid=$!
-
-    # 运行 fieldiag（带超时保护）
-    log_info "开始执行 fieldiag（超时: ${fieldiag_timeout}秒）..."
-    log_info "命令: ${fieldiag_bin} ${fieldiag_args}"
-
-    local field_start=$(date +%s)
-    timeout "${fieldiag_timeout}" bash -c "${fieldiag_bin} ${fieldiag_args}" > "${RAW_DATA_DIR}/fieldiag_diag.txt" 2>&1
-    local field_ret=$?
-    local field_end=$(date +%s)
-    local field_elapsed=$(( field_end - field_start ))
-    local field_elapsed_fmt=$(printf '%dh%dm%ds' $((field_elapsed/3600)) $(((field_elapsed%3600)/60)) $((field_elapsed%60)))
-    echo "耗时: ${field_elapsed_fmt}" >> "${RAW_DATA_DIR}/fieldiag_diag.txt"
-    echo "返回码: ${field_ret}" >> "${RAW_DATA_DIR}/fieldiag_diag.txt"
-
-    # 停止监控
-    kill "${monitor_pid}" 2>/dev/null; wait "${monitor_pid}" 2>/dev/null
-
-    # 判定结果
-    if [ ${field_ret} -eq 0 ]; then
-        log_ok "fieldiag ${test_level_desc} 诊断通过 (耗时: ${field_elapsed_fmt})"
-        echo "PASS" > "${RAW_DATA_DIR}/fieldiag_result.txt"
-    elif [ ${field_ret} -eq 124 ]; then
-        log_warn "fieldiag 超时（>${fieldiag_timeout}秒），可能需要降低级别或检查GPU负载"
-        echo "TIMEOUT" > "${RAW_DATA_DIR}/fieldiag_result.txt"
-    else
-        log_error "fieldiag 诊断未通过 (返回码=${field_ret}, 耗时: ${field_elapsed_fmt})"
-        log_error "请查看原始输出: ${RAW_DATA_DIR}/fieldiag_diag.txt"
-        echo "FAIL" > "${RAW_DATA_DIR}/fieldiag_result.txt"
-    fi
-
-    log_ok "fieldiag 原厂现场诊断完成"
-}
-
-# =========================================
-# 12. ECC 错误检查（数据中心GPU关键项）
-# =========================================
-test_ecc() {
-    log_info "========== 12. ECC 错误检查 =========="
-
-    # nvidia-smi 方式
-    save_raw "nvidia_smi_ecc" \
-        bash -c "nvidia-smi --query-gpu=index,name,ecc.mode.current,ecc.errors.corrected.volatile.total,ecc.errors.uncorrected.volatile.total,ecc.errors.corrected.aggregate.total,ecc.errors.uncorrected.aggregate.total,retired_pages.single_bit_ecc.count,retired_pages.double_bit.count,retired_pages.pending --format=csv 2>/dev/null || echo 'ECC Query Unavailable'"
-
-    # Xid 错误计数
-    save_raw "nvidia_smi_retired_pages" \
-        bash -c "nvidia-smi -q -d ECC,MEMORY,RETIRED_PAGES,PAGE_RETIREMENT 2>/dev/null || true"
-
-    # dmesg 中的 Xid 错误
-    save_raw "dmesg_xid" \
-        bash -c "dmesg | grep -i 'NVRM\|Xid\|nvrm' | tail -100 2>/dev/null || true"
-
-    log_ok "ECC/错误计数采集完成"
-}
-
-# =========================================
-# 12.5 NVIDIA 原厂现场质检（Field Validation）
-#   覆盖 NVIDIA 官方工厂/现场质检标准全量域：
-#   ROW_REMAPPER(显存行重映射) / NVLink / MIG / TILE(多芯片封装)
-#   POWER_MANAGEMENT / VIRTUALIZATION / SUPPORTED_CLOCKS
-#   ENCODER/DECODER / SERIAL(保修验证) / COMPUTE(运行模式)
-#   这是数据中心GPU(H100~B300)原厂质检/RMA判定的核心依据
-# =========================================
-test_factory_validation() {
-    log_info "========== 12.5 NVIDIA 原厂现场质检（Field Validation） =========="
-
-    # --- (1) 显存行重映射器 ROW_REMAPPER ---
-    # NVIDIA 硬件级显存冗余修复机制：当某显存行故障时，硬件自动重映射到备用行。
-    # 若备用行耗尽（remapping_failure=Yes / pending_remissions>0），则需RMA。
-    # 这是原厂质检/RMA判定的【第一核心依据】
-    log_info "[Field-01] 显存行重映射器（ROW_REMAPPER）..."
-    save_raw "nvsmi_row_remapper" \
-        bash -c "nvidia-smi -q -d ROW_REMAPPER 2>/dev/null || echo 'ROW_REMAPPER 不可用（驱动版本过低或消费级GPU）'"
-
-    # --- (2) NVLink 状态与错误计数 ---
-    # H100/B200/B300 多GPU服务器依赖NVLink/NVSwitch互联，链路错误=硬件故障
-    log_info "[Field-02] NVLink 状态与错误计数..."
-    save_raw "nvsmi_nvlink_status" bash -c "nvidia-smi nvlink -s 2>/dev/null || echo 'NVLink 不可用'"
-    save_raw "nvsmi_nvlink_counters" bash -c "nvidia-smi nvlink -ct 0 2>/dev/null || true"  # 计数器类型0
-    save_raw "nvsmi_nvlink_errors" bash -c "nvidia-smi nvlink -e 2>/dev/null || true"       # 错误计数
-    # NVLink 拓扑和远端GPU信息
-    save_raw "nvsmi_nvlink_topology" bash -c "nvidia-smi -q -d NVLINK 2>/dev/null || true"
-
-    # NVSwitch 检测（DGX/HGX级服务器）
-    save_raw "nvsmi_nvswitch" bash -c "nvidia-smi -q -d NVSWITCH 2>/dev/null || true"
-    save_raw "lspci_nvswitch" bash -c "lspci 2>/dev/null | grep -i 'nvswitch\|ibm.*npu' || echo '未检测到NVSwitch'"
-
-    # --- (3) MIG 多实例GPU验证 ---
-    # H100/B200/B300 的关键特性：将单GPU切分为多个独立计算实例
-    log_info "[Field-03] MIG 多实例GPU配置验证..."
-    save_raw "nvsmi_mig_status" bash -c "nvidia-smi mig -lgi 2>/dev/null || echo 'MIG 未启用或不可用'"
-    save_raw "nvsmi_mig_ci" bash -c "nvidia-smi mig -lci 2>/dev/null || true"
-    save_raw "nvsmi_mig_device" bash -c "nvidia-smi -q -d MIG 2>/dev/null || true"
-
-    # --- (4) TILE 多芯片封装验证 ---
-    # B200/B300 采用多芯片封装(multi-die)，需验证各Tile状态
-    log_info "[Field-04] TILE 多芯片封装状态验证..."
-    save_raw "nvsmi_tile" bash -c "nvidia-smi -q -d TILE 2>/dev/null || echo 'TILE 不可用（单芯片GPU正常）'"
-
-    # --- (5) 功耗管理策略验证 ---
-    log_info "[Field-05] 功耗管理策略（POWER_MANAGEMENT）..."
-    save_raw "nvsmi_power_mgmt" bash -c "nvidia-smi -q -d POWER_MANAGEMENT 2>/dev/null || echo 'POWER_MANAGEMENT 不可用'"
-
-    # --- (6) 虚拟化支持验证（vGPU/SR-IOV）---
-    log_info "[Field-06] 虚拟化支持验证（VIRTUALIZATION）..."
-    save_raw "nvsmi_virtualization" bash -c "nvidia-smi -q -d VIRTUALIZATION 2>/dev/null || echo 'VIRTUALIZATION 不可用'"
-
-    # --- (7) 合规时钟频率验证 ---
-    # 确认GPU能运行在NVIDIA规格书标称的时钟频率
-    log_info "[Field-07] 合规时钟频率（SUPPORTED_CLOCKS）..."
-    save_raw "nvsmi_supported_clocks" bash -c "nvidia-smi -q -d SUPPORTED_CLOCKS 2>/dev/null || echo 'SUPPORTED_CLOCKS 不可用'"
-
-    # --- (8) 视频编码/解码引擎验证（NVENC/NVDEC）---
-    log_info "[Field-08] 视频编解码引擎（NVENC/NVDEC）..."
-    save_raw "nvsmi_encoder" bash -c "nvidia-smi -q -d ENCODER 2>/dev/null || true"
-    save_raw "nvsmi_decoder" bash -c "nvidia-smi -q -d DECODER 2>/dev/null || true"
-
-    # --- (9) 序列号/保修验证 ---
-    # 原厂质检需核对GPU序列号与发货记录一致，防伪/保修验证
-    log_info "[Field-09] 序列号/保修验证（SERIAL）..."
-    save_raw "nvsmi_serial" bash -c "nvidia-smi -q -d SERIAL 2>/dev/null || echo 'SERIAL 不可用'"
-    # inforom 完整性（含OEM/inforom校验和）
-    save_raw "nvsmi_inforom" bash -c "nvidia-smi -q -d INFOROM 2>/dev/null || true"
-
-    # --- (10) 运行模式验证（Persistence/Compute Mode）---
-    log_info "[Field-10] 运行模式验证（COMPUTE/PERSISTENCE）..."
-    save_raw "nvsmi_compute_mode" bash -c "nvidia-smi -q -d COMPUTE 2>/dev/null || true"
-    save_raw "nvsmi_persistence" \
-        bash -c "nvidia-smi --query-gpu=index,persistence_mode,compute_mode,driver_version,vbios_version,inforom.img,inforom.oem,inforom.ece --format=csv 2>/dev/null || true"
-
-    # --- (11) 全域一次性查询（备份完整快照，便于复核）---
-    log_info "[Field-11] nvidia-smi 全域查询快照..."
-    save_raw "nvsmi_all_domains" \
-        bash -c "nvidia-smi -q 2>/dev/null || echo 'nvidia-smi -q 失败'"
-
-    # --- (12) DCGM 策略合规与分组验证 ---
-    if command -v dcgmi &>/dev/null; then
-        log_info "[Field-12] DCGM 策略合规与GPU分组..."
-        save_raw "dcgmi_policy" bash -c "dcgmi policy -l 2>/dev/null || true"  # 列出策略
-        save_raw "dcgmi_group" bash -c "dcgmi group -l 2>/dev/null || true"  # 列出GPU分组
-        save_raw "dcgmi_profile" bash -c "dcgmi profile -l 2>/dev/null || true"  # 性能配置文件
-        save_raw "dcgmi_settings" bash -c "dcgmi settings -l 2>/dev/null || true"  # 全局设置
-    fi
-
-    # --- (13) 页面重映射/退役详细状态（补充ECC部分的深度信息）---
-    log_info "[Field-13] 页面退役与重映射详细状态..."
-    save_raw "nvsmi_page_retirement" bash -c "nvidia-smi -q -d PAGE_RETIREMENT,RETIRED_PAGES 2>/dev/null || true"
-
-    # --- (14) CC（Concurrent Command）/可恢复页错误计数 ---
-    save_raw "nvsmi_clock_policy" bash -c "nvidia-smi -q -d CLOCK_POLICY 2>/dev/null || true"
-
-    log_ok "NVIDIA 原厂现场质检（Field Validation）全部完成"
-}
-
-# =========================================
-# 13. 显存校验测试
-#   优先级1 [原厂]: cuda-memcheck — NVIDIA原厂CUDA内存错误检测器（随CUDA Toolkit自带）
-#     检测项：越界访问、未初始化内存读取、地址对齐错误、全局/共享内存竞争
-#   优先级2 [第三方]: cuda_memtest — 10种模式显存写入-读出-校验
-#     Test0~10: Walking 1s/0s, Random, Gaussian, Solid Bits, Address Fetch...
-#   优先级3 [原厂]: bandwidthTest shmoo — 仅测带宽（回退方案，无正确性校验）
-#   任何模式报错 = 显存硬件故障 → 需RMA
-# =========================================
-test_memory() {
-    log_info "========== 13. 显存校验测试 =========="
-    local factory_bin
-    factory_bin=$(cat "${OUTPUT_DIR}/factory_bin_dir.txt" 2>/dev/null)
-    local cuda_bin
-    cuda_bin=$(cat "${OUTPUT_DIR}/cuda_bin_dir.txt" 2>/dev/null)
-    local gpu_count
-    gpu_count=$(cat "${OUTPUT_DIR}/gpu_count.txt")
-
-    for (( i=0; i<gpu_count; i++ )); do
-        # 优先级1: 原厂 cuda-memcheck（对官方matrixMul做内存错误检测）
-        if [ -x "${factory_bin}/cuda-memcheck" ] && [ -x "${cuda_bin}/matrixMul" ]; then
-            log_info "GPU ${i}: [原厂] cuda-memcheck + matrixMul 内存错误检测..."
-            CUDA_VISIBLE_DEVICES=${i} save_raw "cuda_memcheck_gpu${i}" \
-                "${factory_bin}/cuda-memcheck" --tool memcheck \
-                "${cuda_bin}/matrixMul" -wA=2048 -hA=2048 -wB=2048 -hB=2048
-        fi
-
-        # 优先级2: 第三方 cuda_memtest（10种模式显存校验）
-        if [ -x "${factory_bin}/cuda_memtest" ]; then
-            log_info "GPU ${i}: [第三方] cuda_memtest 10种模式显存校验（可能需要数分钟）..."
-            CUDA_VISIBLE_DEVICES=${i} save_raw "cuda_memtest_gpu${i}" \
-                "${factory_bin}/cuda_memtest" --disable_gpu_lock
-        elif [ -x "${cuda_bin}/bandwidthTest" ]; then
-            # 优先级3: 原厂 bandwidthTest shmoo（仅测带宽，无正确性校验）
-            log_warn "GPU ${i}: [回退] bandwidthTest shmoo（仅带宽测试，无正确性校验）"
-            CUDA_VISIBLE_DEVICES=${i} save_raw "memtest_shmoo_gpu${i}" \
-                "${cuda_bin}/bandwidthTest" --device=${i} --memory=device --mode=shmoo
-        else
-            log_warn "GPU ${i}: 无可用显存测试工具，跳过"
-        fi
-    done
-
-    log_ok "显存校验测试完成"
-}
-
-# =========================================
-# 13.5 满载烧机+正确性校验
-#   [原厂] dcgmi diag -r 3 的 Targeted Stress 已在第11步运行
-#   [第三方] gpu-burn: 矩阵乘法结果与CPU基准逐元素比对（补充烧机）
-#   两者互补，出厂质检必跑项
-# =========================================
-test_gpu_burn() {
-    wait_for_ready "gpu-burn满载烧机"
-    log_info "========== 13.5 满载烧机+正确性校验 =========="
-    local factory_bin
-    factory_bin=$(cat "${OUTPUT_DIR}/factory_bin_dir.txt" 2>/dev/null)
-    local gpu_count
-    gpu_count=$(cat "${OUTPUT_DIR}/gpu_count.txt")
-
-    if [ ! -x "${factory_bin}/gpu_burn" ]; then
-        log_warn "[第三方] gpu_burn 不可用，跳过（原厂dcgmi diag -r 3已在第11步覆盖压力测试）"
-        return
-    fi
-
-    # 启动后台温度/功耗监控
-    log_info "启动 nvidia-smi 后台监控（gpu-burn 烧机期间）..."
-    nvidia-smi --query-gpu=timestamp,index,name,temperature.gpu,power.draw,fan.speed,utilization.gpu,memory.used,memory.total \
-        --format=csv -l 2 -f "${RAW_DATA_DIR}/gpu_monitor_burn.csv" &
-    local monitor_pid=$!
-
-    # gpu-burn 用法: gpu_burn <seconds> <device_id>
-    # 逐GPU烧机（确保每块GPU都被独立校验）
-    for (( i=0; i<gpu_count; i++ )); do
-        wait_for_ready "gpu-burn烧机 GPU ${i}/${gpu_count}"
-        log_info "GPU ${i}: [第三方] gpu-burn 满载烧机 ${GPUBURN_DURATION_SEC} 秒（含矩阵乘法正确性校验）..."
-        CUDA_VISIBLE_DEVICES=${i} save_raw "gpu_burn_gpu${i}" \
-            "${factory_bin}/gpu_burn" "${GPUBURN_DURATION_SEC}" "${i}"
-    done
-
-    # 停止监控
-    kill "${monitor_pid}" 2>/dev/null; wait "${monitor_pid}" 2>/dev/null
-
-    log_ok "满载烧机+正确性校验完成"
-}
-
-# =========================================
-# 14. PCIe 链路状态重训检查
-# =========================================
-test_pcie_link() {
-    log_info "========== 14. PCIe 链路状态检查 =========="
-
-    # 运行带宽测试前后对比链路状态
-    save_raw "pcie_link_status" \
-        nvidia-smi --query-gpu=index,pci.bus_id,pcie.link.gen.current,pcie.link.gen.max,pcie.link.width.current,pcie.link.width.max,pcie.link.gen.max,pcie.replay_errors --format=csv
-
-    # lspci 详细链路信息
-    save_raw "lspci_vga_verbose" \
-        bash -c "for dev in \$(lspci | grep -i nvidia | awk '{print \$1}'); do echo '=== PCIe $dev ==='; lspci -vvv -s \$dev | grep -E 'LnkSta|LnkCap|DevSta|Width|Speed' ; done"
-
-    log_ok "PCIe 链路状态采集完成"
-}
-
-# =========================================
-# 15. 调用 Python 生成报告
-# =========================================
-generate_final_report() {
-    log_info "========== 15. 生成售后服务报告 =========="
-
-    if [ ! -f "${SCRIPT_DIR}/generate_report.py" ]; then
-        log_error "找不到报告生成脚本 generate_report.py，请确认其与本脚本同目录"
+    if [ "${NET_REACHABLE_CACHED}" != "yes" ]; then
+        log_warn "当前网络不可达，跳过驱动apt安装，请先联网或手动安装"
         return 1
     fi
 
-    python3 "${SCRIPT_DIR}/generate_report.py" \
-        --output_dir "${OUTPUT_DIR}" \
-        --raw_data_dir "${RAW_DATA_DIR}" \
-        --log_file "${LOG_FILE}" \
-        2>&1 | tee -a "${LOG_FILE}"
+    run_apt_safe update || true
+    run_apt_safe install -y --no-install-recommends ubuntu-drivers-common software-properties-common dkms build-essential || true
 
-    if [ -f "${OUTPUT_DIR}/report.html" ]; then
-        log_ok "售后报告已生成: ${OUTPUT_DIR}/report.html"
-        log_ok "JSON数据已生成: ${OUTPUT_DIR}/report_data.json"
+    (
+        sudo add-apt-repository -y ppa:graphics-drivers/ppa 2>&1 | tee -a "${LOG_FILE}"
+    ) || log_warn "添加 graphics-drivers PPA 失败，尝试使用默认仓库"
+
+    run_apt_safe update || true
+
+    local RECOMMENDED=""
+    RECOMMENDED="$(ubuntu-drivers devices 2>/dev/null | grep -i recommended | awk '{print $3}' | head -n1 || true)"
+    if [ -z "${RECOMMENDED}" ]; then
+        RECOMMENDED="nvidia-driver-560-server"
+        log_info "ubuntu-drivers 未返回推荐驱动，使用默认: ${RECOMMENDED}"
+    else
+        log_info "ubuntu-drivers 推荐驱动: ${RECOMMENDED}"
+    fi
+
+    run_apt_safe install -y "${RECOMMENDED}" dkms || true
+
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        log_ok "驱动安装成功！当前版本: $(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1)"
+        log_warn "⚠️  强烈建议执行 sudo reboot 重启后再跑测试（dkms模块需新内核加载，否则后续CUDA/nvidia-smi可能段错误）"
+        return 0
+    else
+        log_error "驱动apt安装后仍无 nvidia-smi，请手动执行："
+        echo "  方案A: sudo ubuntu-drivers autoinstall && sudo reboot"
+        echo "  方案B: sudo apt-get install -y nvidia-driver-560-server dkms && sudo reboot"
+        echo "  方案C: 从 https://www.nvidia.com/Download 下载 .run 文件:"
+        echo "         sudo systemctl stop gdm3; sudo sh NVIDIA-Linux-*.run --dkms"
+        return 1
     fi
 }
 
-# =========================================
-# 主流程
-# =========================================
-main() {
-    # 参数解析
-    local skip_install=false
-    local stress_only=false
-    for arg in "$@"; do
-        case "${arg}" in
-            --skip-install) skip_install=true ;;
-            --stress-only)  stress_only=true  ;;
-            --field-level)  shift_next_field_level=true ;;
-            --gpuburn-time)  shift_next_gpuburn=true ;;
-            --force-fieldiag) FORCE_FIELDIAG=true ;;
-            *)
-                if [ "${shift_next_field_level}" = "true" ]; then
-                    FIELD_LEVEL="${arg}"
-                    shift_next_field_level=false
-                elif [ "${shift_next_gpuburn}" = "true" ]; then
-                    if [[ "${arg}" =~ ^[0-9]+$ ]] && [ "${arg}" -gt 0 ]; then
-                        GPUBURN_DURATION_SEC="${arg}"
-                    else
-                        echo "[WARN] --gpuburn-time 参数无效，保留默认 ${GPUBURN_DURATION_SEC} 秒" >&2
-                    fi
-                    shift_next_gpuburn=false
-                fi
-                ;;
-            -h|--help)
-                cat <<EOF
-NVIDIA GPU 售后服务自动化测试脚本
+# ==================== 顺序16: install_cuda_toolkit() ====================
+install_cuda_toolkit() {
+    log_info "===== CUDA Toolkit 检查/安装 ====="
+    if command -v nvcc >/dev/null 2>&1; then
+        local nv_ver
+        nv_ver="$(nvcc --version 2>/dev/null | grep -E 'release [0-9]' | head -n1 || echo unknown)"
+        log_ok "nvcc 已就绪: ${nv_ver}"
+        compile_cuda_samples
+        return 0
+    fi
 
-用法:
-  sudo bash $0 [选项]
+    local CUDA_RUNFILE="cuda_${CUDA_VERSION}_${CUDA_RUNFILE_VERSION}_linux.run"
+    local CUDA_URL="https://developer.download.nvidia.com/compute/cuda/${CUDA_VERSION}/local_installers/${CUDA_RUNFILE}"
+    local CUDA_KEYRING_URL="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb"
+    local INSTALLED_OK=false
 
-选项:
-  --skip-install       跳过驱动/CUDA/DCGM安装，直接运行测试
-  --stress-only        仅运行压力测试，快速查验温度/功耗
-  --field-level N      NVIDIA fieldiag 原厂现场诊断级别:
-                         1 = 快速测试 (约5~15分钟)
-                         2 = 中等深度 (约4小时)
-                         3 = 完整诊断 (约6小时)
-  --gpuburn-time N     gpu-burn 满载烧机时长，单位：秒（每块GPU单独算）
-                         售后服务推荐：120~300
-  --force-fieldiag     【慎用】强制跳过 fieldiag 所有预检（GPU产品线/30秒快速预检/二进制兼容）
-                       仅在你100%确认fieldiag版本+GPU完全匹配时才用，否则可能卡死数小时
-  -h, --help           显示此帮助
+    if [ "${NET_REACHABLE_CACHED}" != "yes" ]; then
+        log_warn "网络不可达，跳过CUDA自动安装（可手动下载runfile后执行）"
+        log_info "手动命令: wget ${CUDA_URL} && sudo sh ${CUDA_RUNFILE} --silent --toolkit"
+        mkdir -p "${OUTPUT_DIR}/cuda_samples_bin"
+        echo "${OUTPUT_DIR}/cuda_samples_bin" > "${CUDA_BIN_DIR_FILE}"
+        return 1
+    fi
 
-输出目录:
-  ${SCRIPT_DIR}/gpu_test_results_YYYYMMDD_HHMMSS/
-    ├── report.html              (售后服务正式报告，HTML格式)
-    ├── report_data.json         (结构化原始数据)
-    ├── test.log                 (完整运行日志)
-    ├── cuda_samples_bin/        (编译后的官方测试工具)
-    ├── factory_tools_bin/       (原厂+第三方质检工具)
-    └── raw_data/                (所有原始测试输出)
+    log_info "尝试方式1: 下载 CUDA runfile ${CUDA_RUNFILE}"
+    if command -v wget >/dev/null 2>&1; then
+        ( cd /tmp && wget -q --show-progress "${CUDA_URL}" -O "/tmp/${CUDA_RUNFILE}" ) 2>&1 | tee -a "${LOG_FILE}" || true
+    elif command -v curl >/dev/null 2>&1; then
+        ( cd /tmp && curl -fsSL -o "/tmp/${CUDA_RUNFILE}" "${CUDA_URL}" ) 2>&1 | tee -a "${LOG_FILE}" || true
+    fi
+
+    if [ -f "/tmp/${CUDA_RUNFILE}" ] && [ -s "/tmp/${CUDA_RUNFILE}" ]; then
+        log_info "runfile 下载完成，开始静默安装 toolkit+samples"
+        chmod +x "/tmp/${CUDA_RUNFILE}"
+        ( sudo sh "/tmp/${CUDA_RUNFILE}" --silent --toolkit --samples --samplespath=/usr/local/cuda/samples --override ) 2>&1 | tee -a "${LOG_FILE}" || true
+        if [ -f /usr/local/cuda/bin/nvcc ]; then
+            INSTALLED_OK=true
+            log_ok "CUDA runfile 安装成功"
+        fi
+    fi
+
+    if [ "${INSTALLED_OK}" = "false" ]; then
+        log_info "尝试方式2: cuda-keyring.deb + apt 安装 cuda-toolkit-12-6-1"
+        if command -v wget >/dev/null 2>&1; then
+            wget -q "${CUDA_KEYRING_URL}" -O /tmp/cuda-keyring.deb 2>&1 | tee -a "${LOG_FILE}" || true
+        elif command -v curl >/dev/null 2>&1; then
+            curl -fsSL -o /tmp/cuda-keyring.deb "${CUDA_KEYRING_URL}" 2>&1 | tee -a "${LOG_FILE}" || true
+        fi
+        if [ -f /tmp/cuda-keyring.deb ] && [ -s /tmp/cuda-keyring.deb ]; then
+            sudo dpkg -i /tmp/cuda-keyring.deb 2>&1 | tee -a "${LOG_FILE}" || true
+            run_apt_safe update || true
+            run_apt_safe install -y cuda-toolkit-12-6-1 || true
+            if [ -f /usr/local/cuda/bin/nvcc ]; then
+                INSTALLED_OK=true
+                log_ok "CUDA apt 安装成功"
+            fi
+        fi
+    fi
+
+    export PATH="/usr/local/cuda/bin:${PATH}"
+    export LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH}"
+    if ! grep -q 'cuda/bin' /etc/profile.d/cuda.sh 2>/dev/null; then
+        echo 'export PATH=/usr/local/cuda/bin:$PATH' | sudo tee /etc/profile.d/cuda.sh >/dev/null 2>&1 || true
+        echo 'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH' | sudo tee -a /etc/profile.d/cuda.sh >/dev/null 2>&1 || true
+    fi
+
+    if command -v nvcc >/dev/null 2>&1; then
+        log_ok "nvcc 已就绪: $(nvcc --version 2>/dev/null | grep -E 'release [0-9]' | head -n1)"
+        compile_cuda_samples
+    else
+        log_error "CUDA Toolkit 自动安装失败，请手动执行："
+        echo "  # 方式1 runfile（推荐）"
+        echo "  wget ${CUDA_URL}"
+        echo "  sudo sh ${CUDA_RUNFILE} --silent --toolkit --samples --samplespath=/usr/local/cuda/samples --override"
+        echo ""
+        echo "  # 方式2 apt"
+        echo "  wget ${CUDA_KEYRING_URL}"
+        echo "  sudo dpkg -i cuda-keyring_1.1-1_all.deb && sudo apt-get update"
+        echo "  sudo apt-get install -y cuda-toolkit-12-6-1"
+        mkdir -p "${OUTPUT_DIR}/cuda_samples_bin"
+        echo "${OUTPUT_DIR}/cuda_samples_bin" > "${CUDA_BIN_DIR_FILE}"
+    fi
+}
+
+# ==================== 顺序17: compile_cuda_samples() ====================
+compile_cuda_samples() {
+    local CUDA_SAMPLES_SRC="/usr/local/cuda/samples"
+    local BIN_DIR="${OUTPUT_DIR}/cuda_samples_bin"
+    mkdir -p "${BIN_DIR}"
+    echo "${BIN_DIR}" > "${CUDA_BIN_DIR_FILE}"
+    log_info "开始编译 CUDA Samples（输出目录: ${BIN_DIR}）"
+
+    local NVCC_BIN="/usr/local/cuda/bin/nvcc"
+    [ ! -x "${NVCC_BIN}" ] && NVCC_BIN="$(command -v nvcc 2>/dev/null || echo nvcc)"
+
+    local samples=(
+        "1_Utilities/deviceQuery:deviceQuery"
+        "1_Utilities/bandwidthTest:bandwidthTest"
+        "5_Simulations/nbody:nbody"
+        "0_Simple/matrixMul:matrixMul"
+        "1_Utilities/topologyQuery:topologyQuery"
+        "1_Utilities/p2pBandwidthLatencyTest:p2pBandwidthLatencyTest"
+    )
+
+    for entry in "${samples[@]}"; do
+        local subdir="${entry%%:*}"
+        local target="${entry##*:}"
+        local src_dir="${CUDA_SAMPLES_SRC}/${subdir}"
+        if [ ! -d "${src_dir}" ]; then
+            log_warn "跳过 ${target}: 源码目录不存在 (${src_dir})"
+            continue
+        fi
+        log_info "编译 ${target} ..."
+        (
+            cd "${src_dir}" && make NVCC="${NVCC_BIN}" clean >/dev/null 2>&1 || true
+            cd "${src_dir}" && make NVCC="${NVCC_BIN}" -j"$(nproc 2>/dev/null || echo 2)" 2>&1 | tee -a "${LOG_FILE}"
+        )
+        local rc=$?
+        if [ "${rc}" -eq 0 ] && [ -x "${src_dir}/${target}" ]; then
+            cp "${src_dir}/${target}" "${BIN_DIR}/" 2>/dev/null || true
+            log_ok "  ${target} 编译成功 -> ${BIN_DIR}/${target}"
+        else
+            log_warn "  ${target} 编译失败 (rc=${rc})，跳过（不影响其他测试）"
+        fi
+    done
+}
+
+# ==================== 顺序18: install_dcgm() ====================
+install_dcgm() {
+    log_info "===== NVIDIA DCGM 检查/安装 ====="
+    if command -v dcgmi >/dev/null 2>&1; then
+        log_ok "dcgmi 已就绪: $(dcgmi --version 2>/dev/null | head -n1 || echo unknown)"
+        return 0
+    fi
+
+    if [ "${NET_REACHABLE_CACHED}" != "yes" ]; then
+        log_warn "网络不可达，跳过DCGM安装"
+        log_info "手动安装: https://developer.nvidia.com/dcgm"
+        return 1
+    fi
+
+    local key_url="https://nvidia.github.io/dcgm/gpgkey.pub"
+    local list_url="https://nvidia.github.io/dcgm/ubuntu2404/x86_64/dcgm.list"
+    local installed_ok=false
+
+    log_info "添加 NVIDIA DCGM GPG key + 源..."
+    if command -v curl >/dev/null 2>&1; then
+        ( curl -fsSL "${key_url}" | sudo gpg --dearmor -o /usr/share/keyrings/dcgm-archive-keyring.gpg ) 2>&1 | tee -a "${LOG_FILE}" || true
+        ( curl -fsSL "${list_url}" | sudo tee /etc/apt/sources.list.d/dcgm.list >/dev/null ) 2>&1 | tee -a "${LOG_FILE}" || true
+    elif command -v wget >/dev/null 2>&1; then
+        ( wget -qO - "${key_url}" | sudo gpg --dearmor -o /usr/share/keyrings/dcgm-archive-keyring.gpg ) 2>&1 | tee -a "${LOG_FILE}" || true
+        ( wget -qO - "${list_url}" | sudo tee /etc/apt/sources.list.d/dcgm.list >/dev/null ) 2>&1 | tee -a "${LOG_FILE}" || true
+    fi
+
+    if [ -f /etc/apt/sources.list.d/dcgm.list ]; then
+        run_apt_safe update || true
+        run_apt_safe install -y datacenter-gpu-manager || true
+        if command -v dcgmi >/dev/null 2>&1; then installed_ok=true; fi
+    fi
+
+    if [ "${installed_ok}" = "false" ]; then
+        log_info "DCGM源方式失败，直接尝试 apt install datacenter-gpu-manager"
+        run_apt_safe update || true
+        run_apt_safe install -y datacenter-gpu-manager || true
+        command -v dcgmi >/dev/null 2>&1 && installed_ok=true
+    fi
+
+    if command -v dcgmi >/dev/null 2>&1; then
+        sudo systemctl enable --now nvidia-dcgm.service 2>&1 | tee -a "${LOG_FILE}" || true
+        sleep 2
+        log_ok "dcgmi 安装成功: $(dcgmi --version 2>/dev/null | head -n1 || echo unknown)"
+    else
+        log_warn "DCGM 自动安装失败，手动执行以下4行："
+        echo "  curl -fsSL ${key_url} | sudo gpg --dearmor -o /usr/share/keyrings/dcgm-archive-keyring.gpg"
+        echo "  curl -fsSL ${list_url} | sudo tee /etc/apt/sources.list.d/dcgm.list"
+        echo "  sudo apt-get update && sudo apt-get install -y datacenter-gpu-manager"
+        echo "  sudo systemctl enable --now nvidia-dcgm.service"
+    fi
+}
+
+# ==================== 顺序19: install_factory_tools() ====================
+install_factory_tools() {
+    log_info "===== 原厂/第三方工厂工具安装 ====="
+    local FACTORY_BIN="${OUTPUT_DIR}/factory_tools_bin"
+    mkdir -p "${FACTORY_BIN}"
+    echo "${FACTORY_BIN}" > "${FACTORY_BIN_DIR_FILE}"
+    export PATH="/usr/local/cuda/bin:${PATH}"
+
+    local status_cuda_memcheck="MISSING"
+    local status_nvbandwidth="MISSING"
+    local status_gpu_burn="MISSING"
+    local status_cuda_memtest="MISSING"
+
+    if [ -f /usr/local/cuda/bin/cuda-memcheck ]; then
+        cp /usr/local/cuda/bin/cuda-memcheck "${FACTORY_BIN}/" 2>/dev/null || true
+        status_cuda_memcheck="OK"
+    elif [ -f /usr/local/cuda/bin/compute-sanitizer ]; then
+        cp /usr/local/cuda/bin/compute-sanitizer "${FACTORY_BIN}/cuda-memcheck" 2>/dev/null || true
+        status_cuda_memcheck="OK(compute-sanitizer兼容)"
+    fi
+    if command -v nvbandwidth >/dev/null 2>&1; then
+        cp "$(command -v nvbandwidth)" "${FACTORY_BIN}/" 2>/dev/null || true
+        status_nvbandwidth="OK"
+    elif [ -f /usr/local/cuda/bin/nvbandwidth ]; then
+        cp /usr/local/cuda/bin/nvbandwidth "${FACTORY_BIN}/" 2>/dev/null || true
+        status_nvbandwidth="OK"
+    fi
+
+    local have_downloader=false
+    command -v git >/dev/null 2>&1 && have_downloader=true
+    command -v wget >/dev/null 2>&1 && have_downloader=true
+    command -v curl >/dev/null 2>&1 && have_downloader=true
+
+    local net_ok=false
+    if [ -n "${NET_REACHABLE_CACHED}" ] && [ "${NET_REACHABLE_CACHED}" = "yes" ]; then
+        net_ok=true
+    else
+        if ping -c 2 -W 3 github.com >/dev/null 2>&1 || ping -c 2 -W 3 mirrors.aliyun.com >/dev/null 2>&1; then
+            net_ok=true
+        elif (echo > /dev/tcp/github.com/443) >/dev/null 2>&1 || (echo > /dev/tcp/mirrors.aliyun.com/80) >/dev/null 2>&1; then
+            net_ok=true
+        fi
+    fi
+    NET_REACHABLE_CACHED="${net_ok}"
+
+    local skip_download=false
+    if [ "${have_downloader}" = "false" ] || [ "${net_ok}" = "false" ]; then
+        skip_download=true
+        log_warn "下载条件不满足(have_downloader=${have_downloader}, net_ok=${net_ok})，跳过工具源码编译"
+        log_info "恢复条件后手动执行: sudo apt-get install -y git wget curl build-essential && 重新跑脚本"
+    fi
+
+    log_info "--- gpu-burn ---"
+    local GB_DIR="/tmp/gpu-burn"
+    if [ -f "${FACTORY_BIN}/gpu_burn" ]; then
+        status_gpu_burn="OK"
+    elif [ -f "${GB_DIR}/gpu_burn" ]; then
+        cp "${GB_DIR}/gpu_burn" "${FACTORY_BIN}/" 2>/dev/null || true
+        status_gpu_burn="OK"
+    elif [ "${skip_download}" = "false" ]; then
+        local gb_ok=false
+        if command -v git >/dev/null 2>&1; then
+            ( rm -rf "${GB_DIR}" && git clone --depth 1 https://github.com/wilicc/gpu-burn "${GB_DIR}" ) 2>&1 | tee -a "${LOG_FILE}" && gb_ok=true || true
+            if [ "${gb_ok}" = "false" ]; then
+                ( rm -rf "${GB_DIR}" && git clone --depth 1 https://ghproxy.com/https://github.com/wilicc/gpu-burn "${GB_DIR}" ) 2>&1 | tee -a "${LOG_FILE}" && gb_ok=true || true
+            fi
+        fi
+        if [ "${gb_ok}" = "false" ] && command -v wget >/dev/null 2>&1; then
+            ( wget -q https://github.com/wilicc/gpu-burn/archive/refs/heads/master.zip -O /tmp/gpu-burn.zip && cd /tmp && unzip -qo gpu-burn.zip && rm -rf "${GB_DIR}" && mv gpu-burn-master "${GB_DIR}" ) 2>&1 | tee -a "${LOG_FILE}" && gb_ok=true || true
+            if [ "${gb_ok}" = "false" ]; then
+                ( wget -q https://ghproxy.com/https://github.com/wilicc/gpu-burn/archive/refs/heads/master.zip -O /tmp/gpu-burn.zip && cd /tmp && unzip -qo gpu-burn.zip && rm -rf "${GB_DIR}" && mv gpu-burn-master "${GB_DIR}" ) 2>&1 | tee -a "${LOG_FILE}" && gb_ok=true || true
+            fi
+        fi
+        if [ "${gb_ok}" = "true" ] && [ -d "${GB_DIR}" ]; then
+            log_info "编译 gpu-burn..."
+            ( cd "${GB_DIR}" && make CUDA_DIR=/usr/local/cuda NVCC=/usr/local/cuda/bin/nvcc 2>&1 ) | tee -a "${LOG_FILE}"
+            if [ -x "${GB_DIR}/gpu_burn" ]; then
+                cp "${GB_DIR}/gpu_burn" "${FACTORY_BIN}/"
+                [ -f "${GB_DIR}/compare.ptx" ] && cp "${GB_DIR}/compare.ptx" "${FACTORY_BIN}/" 2>/dev/null || true
+                status_gpu_burn="OK"
+                log_ok "gpu-burn 编译成功"
+            else
+                log_error "gpu-burn 编译失败，30秒后继续（请排查: 1.nvcc是否存在? 2.g++是否安装? 3.CUDA_DIR=/usr/local/cuda 是否正确?）"
+                for i in $(seq 30 -1 1); do printf "\r  倒计时: %02d秒" "${i}"; sleep 1; done; echo ""
+            fi
+        fi
+    fi
+
+    log_info "--- cuda_memtest ---"
+    local CM_DIR="/tmp/cuda_memtest"
+    if [ -f "${FACTORY_BIN}/cuda_memtest" ]; then
+        status_cuda_memtest="OK"
+    elif [ -f "${CM_DIR}/cuda_memtest" ]; then
+        cp "${CM_DIR}/cuda_memtest" "${FACTORY_BIN}/" 2>/dev/null || true
+        status_cuda_memtest="OK"
+    elif [ "${skip_download}" = "false" ]; then
+        local cm_ok=false
+        if command -v git >/dev/null 2>&1; then
+            ( rm -rf "${CM_DIR}" && git clone --depth 1 https://github.com/ComputationalRadiationPhysics/cuda_memtest "${CM_DIR}" ) 2>&1 | tee -a "${LOG_FILE}" && cm_ok=true || true
+            if [ "${cm_ok}" = "false" ]; then
+                ( rm -rf "${CM_DIR}" && git clone --depth 1 https://ghproxy.com/https://github.com/ComputationalRadiationPhysics/cuda_memtest "${CM_DIR}" ) 2>&1 | tee -a "${LOG_FILE}" && cm_ok=true || true
+            fi
+        fi
+        if [ "${cm_ok}" = "false" ] && command -v wget >/dev/null 2>&1; then
+            ( wget -q https://github.com/ComputationalRadiationPhysics/cuda_memtest/archive/refs/heads/master.zip -O /tmp/cuda_memtest.zip && cd /tmp && unzip -qo cuda_memtest.zip && rm -rf "${CM_DIR}" && mv cuda_memtest-master "${CM_DIR}" ) 2>&1 | tee -a "${LOG_FILE}" && cm_ok=true || true
+            if [ "${cm_ok}" = "false" ]; then
+                ( wget -q https://ghproxy.com/https://github.com/ComputationalRadiationPhysics/cuda_memtest/archive/refs/heads/master.zip -O /tmp/cuda_memtest.zip && cd /tmp && unzip -qo cuda_memtest.zip && rm -rf "${CM_DIR}" && mv cuda_memtest-master "${CM_DIR}" ) 2>&1 | tee -a "${LOG_FILE}" && cm_ok=true || true
+            fi
+        fi
+        if [ "${cm_ok}" = "true" ] && [ -d "${CM_DIR}" ]; then
+            log_info "编译 cuda_memtest..."
+            ( cd "${CM_DIR}" && make CUDA_DIR=/usr/local/cuda NVCC=/usr/local/cuda/bin/nvcc 2>&1 ) | tee -a "${LOG_FILE}"
+            if [ -x "${CM_DIR}/cuda_memtest" ]; then
+                cp "${CM_DIR}/cuda_memtest" "${FACTORY_BIN}/"
+                status_cuda_memtest="OK"
+                log_ok "cuda_memtest 编译成功"
+            else
+                log_error "cuda_memtest 编译失败，30秒后继续（排查: nvcc? g++? CUDA_DIR?）"
+                for i in $(seq 30 -1 1); do printf "\r  倒计时: %02d秒" "${i}"; sleep 1; done; echo ""
+            fi
+        fi
+    fi
+
+    log_info "===== 工厂工具就绪状态汇总 ====="
+    log_info "  cuda-memcheck  : ${status_cuda_memcheck}"
+    log_info "  nvbandwidth    : ${status_nvbandwidth}"
+    log_info "  gpu_burn       : ${status_gpu_burn}"
+    log_info "  cuda_memtest   : ${status_cuda_memtest}"
+}
+
+# ==================== 顺序20: enumerate_gpus() - 软着陆版本 ====================
+enumerate_gpus() {
+    log_info "===== GPU 枚举（门禁，软着陆版本）====="
+    local GPU_COUNT=0
+    GPU_COUNT="$(nvidia-smi --query-gpu=count --format=csv,noheader 2>/dev/null | head -n1 || echo 0)"
+    [ "${GPU_COUNT}" = "count" ] && GPU_COUNT=0
+    if [ "${GPU_COUNT}" -eq 0 ] || ! [ "${GPU_COUNT}" -eq "${GPU_COUNT}" ] 2>/dev/null; then
+        local alt
+        alt="$(nvidia-smi -L 2>/dev/null | wc -l || echo 0)"
+        [ "${alt}" -gt 0 ] && GPU_COUNT="${alt}"
+    fi
+
+    if [ "${GPU_COUNT}" -eq 0 ]; then
+        log_error "======================================"
+        log_error "❌ GPU 枚举报错: nvidia-smi 可执行但返回0块GPU"
+        log_error "======================================"
+        log_info "驱动状态诊断开始:"
+        save_raw lsmod_nvidia lsmod
+        save_raw dmesg_nvidia bash -c "dmesg | grep -i -E 'nvidia|NVK|gpu|nvrf'"
+        save_raw nvidia_smi_L nvidia-smi -L
+
+        log_info "lsmod | grep nvidia:"
+        lsmod 2>/dev/null | grep -i nvidia | tee -a "${LOG_FILE}" || echo "  (无nvidia内核模块)" | tee -a "${LOG_FILE}"
+        log_info "dmesg nvidia相关 (最后15行):"
+        dmesg 2>/dev/null | grep -i -E 'nvidia|NVK|gpu' | tail -n15 | tee -a "${LOG_FILE}" || echo "  (无相关消息)" | tee -a "${LOG_FILE}"
+        log_info "nvidia-smi -L:"
+        nvidia-smi -L 2>&1 | tee -a "${LOG_FILE}" || echo "  (失败)" | tee -a "${LOG_FILE}"
+
+        log_error "常见4条解决方案（按顺序试）："
+        echo "  1) Secure Boot: BIOS里关闭 Secure Boot，否则MOK签名会阻止nvidia模块加载"
+        echo "  2) 内核头文件: sudo apt-get install -y linux-headers-$(uname -r) dkms && sudo dpkg-reconfigure nvidia-driver-560-server"
+        echo "  3) ubuntu-drivers: sudo ubuntu-drivers autoinstall && 必须 sudo reboot"
+        echo "  4) 强制reboot: 很多dkms模块只有重启后才加载，reboot后再跑一次脚本"
+
+        log_warn "⚠️  由于驱动未加载/系统APT崩溃，脚本生成【失败原因诊断报告】后正常退出（exit 0）"
+        write_failure_report
+        log_ok "⚠️  诊断报告已生成完毕！report.html 中已写明驱动/APT损坏原因及修复方案"
+        log_ok "报告目录: ${OUTPUT_DIR}"
+        exit 0
+    fi
+
+    log_ok "✅ GPU枚举通过，共检测到 ${GPU_COUNT} 块GPU"
+    echo "${GPU_COUNT}" > "${GPU_COUNT_FILE}"
+
+    nvidia-smi --query-gpu=index,name,uuid,pci.bus_id,serial,serial_number,driver_version,vbios_version,pcie.link.gen.current,pcie.link.width.current,temperature.gpu,memory.total,memory.free,memory.used,utilization.gpu --format=csv -i 0-$((GPU_COUNT-1)) > "${OUTPUT_DIR}/gpu_info.csv" 2>/dev/null || true
+    save_raw nvidia_smi_full_xml nvidia-smi -q -x
+    save_raw nvidia_smi_topo nvidia-smi topo -m
+
+    log_info "逐卡基础信息:"
+    local i=0
+    for i in $(seq 0 $((GPU_COUNT-1))); do
+        local gname gbus gtemp gmem
+        gname="$(nvidia-smi --query-gpu=name --format=csv,noheader -i "${i}" 2>/dev/null || echo UNKNOWN)"
+        gbus="$(nvidia-smi --query-gpu=pci.bus_id --format=csv,noheader -i "${i}" 2>/dev/null || echo UNKNOWN)"
+        gtemp="$(nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader,nounits -i "${i}" 2>/dev/null || echo N/A)"
+        gmem="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits -i "${i}" 2>/dev/null || echo N/A)"
+        log_info "  GPU${i}: ${gname} | Bus=${gbus} | Temp=${gtemp}°C | Mem=${gmem} MiB"
+    done
+
+    GPU_NAME_ARRAY=()
+    for i in $(seq 0 $((GPU_COUNT-1))); do
+        GPU_NAME_ARRAY+=("$(nvidia-smi --query-gpu=name --format=csv,noheader -i "${i}" 2>/dev/null || echo UNKNOWN)")
+    done
+}
+
+# ==================== 顺序21: write_failure_report() ====================
+write_failure_report() {
+    log_info "生成失败原因诊断报告（软着陆）..."
+    local end_ts
+    end_ts="$(date +%Y-%m-%d_%H:%M:%S)"
+    local start="${TS_START//_/ }"
+    start="${start:0:4}-${start:4:2}-${start:6:2} ${start:9:2}:${start:11:2}:${start:13:2}"
+    local net_status="${NET_REACHABLE_CACHED:-unknown}"
+
+    local raw_files=""
+    if [ -d "${RAW_DATA_DIR}" ]; then
+        raw_files="$(ls -1 "${RAW_DATA_DIR}" 2>/dev/null | tr '\n' ' ')"
+    fi
+
+    cat > "${REPORT_DATA_JSON}" <<EOF
+{
+  "summary_status": "FAILED_PRECHECK",
+  "start_ts": "${start}",
+  "end_ts": "${end_ts}",
+  "run_config": {
+    "CUDA_VERSION": "${CUDA_VERSION}",
+    "STRESS_DURATION_SEC": ${STRESS_DURATION_SEC},
+    "GPUBURN_DURATION_SEC": ${GPUBURN_DURATION_SEC},
+    "FIELD_LEVEL": ${FIELD_LEVEL},
+    "TEMP_ALARM_C": ${TEMP_ALARM_C},
+    "TEMP_COOLDOWN_C": ${TEMP_COOLDOWN_C},
+    "SKIP_INSTALL": ${SKIP_INSTALL},
+    "STRESS_ONLY": ${STRESS_ONLY}
+  },
+  "error_summary": "驱动未加载或nvidia-smi返回0块GPU。按顺序排查：1) BIOS关闭Secure Boot 2) sudo apt-get install linux-headers-$(uname -r) dkms 3) sudo ubuntu-drivers autoinstall 4) 必须sudo reboot后重跑",
+  "gpus_found_from_lspci": "$(lspci 2>/dev/null | grep -i nvidia | wc -l || echo 0)",
+  "apt_segfault": true,
+  "network_reachable": "${net_status}",
+  "raw_data_files": "${raw_files}"
+}
 EOF
+
+    cat > "${FAILURE_DIAGNOSIS_FILE}" <<EOF
+=====================================================
+NVIDIA GPU 测试 - 失败诊断报告 (软着陆 exit 0)
+=====================================================
+开始时间: ${start}
+结束时间: ${end_ts}
+输出目录: ${OUTPUT_DIR}
+
+[状态] FAILED_PRECHECK: nvidia-smi返回0块GPU
+-----------------------------------------------------
+常见4条解决方案（按顺序执行）：
+
+1. Secure Boot 关闭
+   进入BIOS/UEFI：找到 Security -> Secure Boot = Disable
+   保存并重启。MOK签名会阻止nvidia内核模块加载。
+
+2. 内核头文件 + dkms 重装
+   sudo apt-get update
+   sudo apt-get install -y linux-headers-\$(uname -r) dkms build-essential
+   sudo dpkg-reconfigure nvidia-driver-560-server
+   sudo reboot
+
+3. ubuntu-drivers autoinstall
+   sudo ubuntu-drivers autoinstall
+   sudo reboot
+
+4. 以上都无效 -> NVIDIA .run 直装
+   去 https://www.nvidia.com/Download/index.aspx 下载对应型号.run
+   sudo systemctl stop gdm3 2>/dev/null
+   sudo sh NVIDIA-Linux-*.run --dkms
+   sudo reboot
+
+[网络状态] ${net_status}
+[PCIe扫描到NVIDIA设备数] $(lspci 2>/dev/null | grep -i nvidia | wc -l || echo 0)
+-----------------------------------------------------
+如果PCIe能扫到但nvidia-smi为0，一定是驱动/内核模块问题（硬件没问题）
+跑完以上1-4步后 sudo reboot 再重新跑本脚本
+=====================================================
+EOF
+    log_ok "失败诊断报告已写入: ${FAILURE_DIAGNOSIS_FILE} / ${REPORT_DATA_JSON}"
+    generate_final_report
+}
+
+# ==================== 顺序22: test_pcie_link() ====================
+test_pcie_link() {
+    log_info "===== PCIe 链路测试 ====="
+    save_raw nvidia_smi_pcie nvidia-smi --query-gpu=index,pci.bus_id,pcie.link.gen.current,pcie.link.gen.max,pcie.link.width.current,pcie.link.width.max,clocks_throttle_reasons.sw_thermal_slowdown --format=csv
+    save_raw lspci_vvv_nvidia bash -c "lspci -vvv 2>/dev/null | grep -A30 -i nvidia"
+    save_raw nvidia_smi_replay bash -c "nvidia-smi -q 2>/dev/null | grep -i replay"
+
+    local GPU_COUNT
+    GPU_COUNT="$(cat "${GPU_COUNT_FILE}" 2>/dev/null || echo 0)"
+    local i=0
+    for i in $(seq 0 $((GPU_COUNT-1))); do
+        wait_for_ready "test_pcie_link_gpu${i}"
+        local cur_gen max_gen cur_w max_w bus_id
+        cur_gen="$(nvidia-smi --query-gpu=pcie.link.gen.current --format=csv,noheader,nounits -i "${i}" 2>/dev/null || echo 0)"
+        max_gen="$(nvidia-smi --query-gpu=pcie.link.gen.max --format=csv,noheader,nounits -i "${i}" 2>/dev/null || echo 0)"
+        cur_w="$(nvidia-smi --query-gpu=pcie.link.width.current --format=csv,noheader,nounits -i "${i}" 2>/dev/null || echo 0)"
+        max_w="$(nvidia-smi --query-gpu=pcie.link.width.max --format=csv,noheader,nounits -i "${i}" 2>/dev/null || echo 0)"
+        bus_id="$(nvidia-smi --query-gpu=pci.bus_id --format=csv,noheader -i "${i}" 2>/dev/null || echo UNKNOWN)"
+
+        local pcie_status="OK"
+        if [ "${cur_gen}" -lt "${max_gen}" ] 2>/dev/null; then pcie_status="WARN_GEN"; fi
+        if [ "${cur_w}" -lt "${max_w}" ] 2>/dev/null; then pcie_status="WARN_WIDTH"; fi
+
+        if [ "${pcie_status}" = "OK" ]; then
+            log_ok "GPU${i} (${bus_id}): PCIe Gen${cur_gen} x${cur_w} / Max Gen${max_gen} x${max_w} ✅"
+        else
+            log_warn "GPU${i} (${bus_id}): PCIe降速! 当前=Gen${cur_gen}x${cur_w} 最大=Gen${max_gen}x${max_w}"
+            echo "    排查建议: 1)BIOS设置PCIe Gen=Max 2)Above 4G Decoding=Enable 3)供电/NVLink线缆插紧 4)换插槽交叉验证" | tee -a "${LOG_FILE}"
+        fi
+
+        local replays
+        replays="$(nvidia-smi -q -i "${i}" 2>/dev/null | grep -i "replay" | grep -oE '[0-9]+' | head -n1 || echo 0)"
+        if [ "${replays}" -gt 0 ] 2>/dev/null; then
+            log_warn "GPU${i}: PCIe Replay错误计数=${replays}（>0 说明信号完整性/金手指问题）"
+        else
+            log_info "GPU${i}: PCIe Replay错误=0 ✅"
+        fi
+    done
+}
+
+# ==================== 顺序23: test_device_query() ====================
+test_device_query() {
+    log_info "===== CUDA deviceQuery ====="
+    local CUDA_BIN_DIR
+    CUDA_BIN_DIR="$(cat "${CUDA_BIN_DIR_FILE}" 2>/dev/null || echo "")"
+    if [ -n "${CUDA_BIN_DIR}" ] && [ -x "${CUDA_BIN_DIR}/deviceQuery" ]; then
+        save_raw cuda_deviceQuery "${CUDA_BIN_DIR}/deviceQuery"
+        local rc=$?
+        if [ "${rc}" -eq 0 ]; then
+            log_ok "deviceQuery 通过 (exit=0)"
+        else
+            log_warn "deviceQuery exit=${rc}，检查 raw_data/cuda_deviceQuery.txt"
+        fi
+    else
+        log_warn "deviceQuery 未编译，使用 nvidia-smi 替代输出算力信息:"
+        save_raw nvidia_smi_compute_cap bash -c "nvidia-smi --query-gpu=index,name,compute_cap --format=csv"
+    fi
+}
+
+# ==================== 顺序24: test_ecc() ====================
+test_ecc() {
+    log_info "===== ECC 错误检查 ====="
+    save_raw nvidia_smi_ecc nvidia-smi --query-gpu=index,name,ecc.mode.current,ecc.errors.corrected.volatile.total,ecc.errors.uncorrected.volatile.total --format=csv
+
+    local GPU_COUNT
+    GPU_COUNT="$(cat "${GPU_COUNT_FILE}" 2>/dev/null || echo 0)"
+    local i=0
+    for i in $(seq 0 $((GPU_COUNT-1))); do
+        local ecc_mode corr uncorr
+        ecc_mode="$(nvidia-smi --query-gpu=ecc.mode.current --format=csv,noheader -i "${i}" 2>/dev/null || echo N/A)"
+        corr="$(nvidia-smi --query-gpu=ecc.errors.corrected.volatile.total --format=csv,noheader,nounits -i "${i}" 2>/dev/null || echo 0)"
+        uncorr="$(nvidia-smi --query-gpu=ecc.errors.uncorrected.volatile.total --format=csv,noheader,nounits -i "${i}" 2>/dev/null || echo 0)"
+        log_info "GPU${i}: ECC=${ecc_mode} | 可纠正=${corr} | 不可纠正=${uncorr}"
+        if [ "${uncorr}" != "0" ] && [ "${uncorr}" != "N/A" ] && [ "${uncorr}" -gt 0 ] 2>/dev/null; then
+            log_error "GPU${i}: ❗️ 单卡存在不可纠正ECC错误 (${uncorr}) = 显存物理坏块 = 必须RMA更换！"
+        fi
+        if [ "${corr}" != "0" ] && [ "${corr}" != "N/A" ] && [ "${corr}" -gt 100 ] 2>/dev/null; then
+            log_warn "GPU${i}: 可纠正ECC错误累积>${corr}，建议持续观察并准备RMA"
+        fi
+    done
+}
+
+# ==================== 顺序25: test_factory_validation() ====================
+test_factory_validation() {
+    log_info "===== 工厂级验证 (cuda-memcheck + nvbandwidth) ====="
+    local FACTORY_BIN
+    FACTORY_BIN="$(cat "${FACTORY_BIN_DIR_FILE}" 2>/dev/null || echo "")"
+    local CUDA_BIN_DIR
+    CUDA_BIN_DIR="$(cat "${CUDA_BIN_DIR_FILE}" 2>/dev/null || echo "")"
+
+    if [ -x "${FACTORY_BIN}/cuda-memcheck" ] && [ -x "${CUDA_BIN_DIR}/deviceQuery" ]; then
+        log_info "执行 cuda-memcheck 扫描 deviceQuery..."
+        local cuda_m_log="${RAW_DATA_DIR}/cuda_memcheck_deviceQuery.log"
+        ( cd "${CUDA_BIN_DIR}" && "${FACTORY_BIN}/cuda-memcheck" --log "${cuda_m_log}" --tool memcheck ./deviceQuery ) 2>&1 | tee -a "${LOG_FILE}" || true
+        save_raw cuda_memcheck_result cat "${cuda_m_log}"
+        if grep -qi "error\|failed\|invalid" "${cuda_m_log}" 2>/dev/null; then
+            log_warn "cuda-memcheck 扫出可疑错误，详见 raw_data/cuda_memcheck_*.log"
+        else
+            log_ok "cuda-memcheck deviceQuery 无错误 ✅"
+        fi
+    else
+        log_warn "cuda-memcheck 或 deviceQuery 不存在，跳过显存越界扫描"
+    fi
+
+    local GPU_COUNT
+    GPU_COUNT="$(cat "${GPU_COUNT_FILE}" 2>/dev/null || echo 0)"
+    if [ -x "${FACTORY_BIN}/nvbandwidth" ]; then
+        log_info "执行 nvbandwidth 逐卡带宽测试..."
+        local all_ids
+        all_ids="$(seq -s, 0 $((GPU_COUNT-1)) 2>/dev/null || echo 0)"
+        save_raw nvbandwidth_all "${FACTORY_BIN}/nvbandwidth" -c 1 -d "${all_ids}"
+        local i=0
+        for i in $(seq 0 $((GPU_COUNT-1))); do
+            local bw_std_gb=0
+            local gen w
+            gen="$(nvidia-smi --query-gpu=pcie.link.gen.current --format=csv,noheader,nounits -i "${i}" 2>/dev/null || echo 4)"
+            w="$(nvidia-smi --query-gpu=pcie.link.width.current --format=csv,noheader,nounits -i "${i}" 2>/dev/null || echo 16)"
+            case "${gen}" in
+                3) bw_std_gb=$(( w * 1 )) ;;
+                4) bw_std_gb=$(( w * 2 )) ;;
+                5) bw_std_gb=$(( w * 4 )) ;;
+                *) bw_std_gb=$(( w * 2 )) ;;
+            esac
+            log_info "GPU${i}: PCIe Gen${gen}x${w} 理论带宽≈${bw_std_gb}GB/s"
+        done
+    else
+        log_warn "nvbandwidth 不存在，使用 CUDA bandwidthTest 替代"
+        if [ -x "${CUDA_BIN_DIR}/bandwidthTest" ]; then
+            save_raw cuda_bandwidth_test "${CUDA_BIN_DIR}/bandwidthTest"
+        fi
+    fi
+}
+
+# ==================== 顺序26: test_memory() ====================
+test_memory() {
+    log_info "===== 显存压力测试 ====="
+    local FACTORY_BIN
+    FACTORY_BIN="$(cat "${FACTORY_BIN_DIR_FILE}" 2>/dev/null || echo "")"
+    local CUDA_BIN_DIR
+    CUDA_BIN_DIR="$(cat "${CUDA_BIN_DIR_FILE}" 2>/dev/null || echo "")"
+
+    if [ -x "${FACTORY_BIN}/cuda_memtest" ]; then
+        log_info "执行 cuda_memtest 全卡显存扫描（可能耗时数分钟）..."
+        wait_for_ready "test_memory_start"
+        save_raw cuda_memtest_run bash -c "cd '${FACTORY_BIN}' && timeout $((STRESS_DURATION_SEC * 2)) ./cuda_memtest 2>&1 || true"
+        if grep -qiE "FAIL|Error|error|FAULT" "${RAW_DATA_DIR}/cuda_memtest_run.txt" 2>/dev/null; then
+            if grep -qv "PASSED\|Completed\|finished" "${RAW_DATA_DIR}/cuda_memtest_run.txt" 2>/dev/null; then
+                log_warn "cuda_memtest 扫到可疑FAIL/ERROR，详见 raw_data/cuda_memtest_run.txt"
+            fi
+        else
+            log_ok "cuda_memtest 显存扫描通过 ✅"
+        fi
+    else
+        log_warn "cuda_memtest 不可用，使用 bandwidthTest device<->device 替代"
+        if [ -x "${CUDA_BIN_DIR}/bandwidthTest" ]; then
+            save_raw cuda_bandwidth_d2d "${CUDA_BIN_DIR}/bandwidthTest" --device=0 --memory=pinned --mode=range --start=1024 --end=10485760 --increment=1024000
+        fi
+    fi
+}
+
+# ==================== 顺序27: test_gpu_burn() ====================
+test_gpu_burn() {
+    log_info "===== gpu-burn 满载正确性校验 ====="
+    local FACTORY_BIN
+    FACTORY_BIN="$(cat "${FACTORY_BIN_DIR_FILE}" 2>/dev/null || echo "")"
+    local CUDA_BIN_DIR
+    CUDA_BIN_DIR="$(cat "${CUDA_BIN_DIR_FILE}" 2>/dev/null || echo "")"
+    local GPU_COUNT
+    GPU_COUNT="$(cat "${GPU_COUNT_FILE}" 2>/dev/null || echo 0)"
+
+    if [ ! -x "${FACTORY_BIN}/gpu_burn" ]; then
+        log_warn "gpu-burn 不可用，跳过满载正确性校验，改用 nbody 长时间压力替代"
+        if [ -x "${CUDA_BIN_DIR}/nbody" ]; then
+            wait_for_ready "test_gpu_burn_fallback"
+            save_raw nbody_fallback timeout $((GPUBURN_DURATION_SEC + 5)) "${CUDA_BIN_DIR}/nbody" -benchmark -fp64 -numbodies=100000
+        fi
+        return 0
+    fi
+
+    local i=0
+    for i in $(seq 0 $((GPU_COUNT-1))); do
+        wait_for_ready "test_gpu_burn_gpu${i}"
+        log_info "GPU${i}: 执行 gpu-burn ${GPUBURN_DURATION_SEC}s（单卡满载，顺序执行）..."
+        local out_log="${RAW_DATA_DIR}/gpu_burn_gpu${i}.log"
+        (
+            cd "${FACTORY_BIN}"
+            timeout $((GPUBURN_DURATION_SEC + 5)) ./gpu_burn "${GPUBURN_DURATION_SEC}" -d "${i}" > "${out_log}" 2>&1 || true
+        )
+        save_raw "gpu_burn_gpu${i}_raw" cat "${out_log}"
+        if grep -qiE "Comparing Stopped OK|Tested successfully|finished.*OK|PASS" "${out_log}" 2>/dev/null; then
+            log_ok "GPU${i}: gpu-burn PASS ✅"
+        else
+            log_warn "GPU${i}: gpu-burn 结果异常，请检查 raw_data/gpu_burn_gpu${i}.log"
+        fi
+    done
+}
+
+# ==================== 顺序28: test_bandwidth() ====================
+test_bandwidth() {
+    log_info "===== CUDA bandwidthTest (H2D/D2H/D2D) ====="
+    local CUDA_BIN_DIR
+    CUDA_BIN_DIR="$(cat "${CUDA_BIN_DIR_FILE}" 2>/dev/null || echo "")"
+    local GPU_COUNT
+    GPU_COUNT="$(cat "${GPU_COUNT_FILE}" 2>/dev/null || echo 0)"
+
+    if [ ! -x "${CUDA_BIN_DIR}/bandwidthTest" ]; then
+        log_warn "bandwidthTest 未编译，跳过"
+        return 0
+    fi
+
+    local i=0
+    for i in $(seq 0 $((GPU_COUNT-1))); do
+        wait_for_ready "test_bandwidth_gpu${i}"
+        save_raw "bandwidthTest_gpu${i}" "${CUDA_BIN_DIR}/bandwidthTest" --device="${i}" --memory=pinned --csv
+        local bw_h2d bw_d2h bw_d2d
+        bw_h2d="$(grep -i 'Host to Device' "${RAW_DATA_DIR}/bandwidthTest_gpu${i}.txt" 2>/dev/null | tail -n1 | awk '{print $(NF-1)}' || echo N/A)"
+        bw_d2h="$(grep -i 'Device to Host' "${RAW_DATA_DIR}/bandwidthTest_gpu${i}.txt" 2>/dev/null | tail -n1 | awk '{print $(NF-1)}' || echo N/A)"
+        bw_d2d="$(grep -i 'Device to Device' "${RAW_DATA_DIR}/bandwidthTest_gpu${i}.txt" 2>/dev/null | tail -n1 | awk '{print $(NF-1)}' || echo N/A)"
+        log_info "GPU${i}: H2D=${bw_h2d} GB/s | D2H=${bw_d2h} GB/s | D2D=${bw_d2d} GB/s"
+    done
+}
+
+# ==================== 顺序29: test_p2p() ====================
+test_p2p() {
+    log_info "===== GPU P2P 带宽/延迟测试 ====="
+    local CUDA_BIN_DIR
+    CUDA_BIN_DIR="$(cat "${CUDA_BIN_DIR_FILE}" 2>/dev/null || echo "")"
+    local GPU_COUNT
+    GPU_COUNT="$(cat "${GPU_COUNT_FILE}" 2>/dev/null || echo 0)"
+
+    save_raw nvidia_smi_p2p nvidia-smi topo -p2p r 2>/dev/null || true
+
+    if [ -x "${CUDA_BIN_DIR}/p2pBandwidthLatencyTest" ] && [ "${GPU_COUNT}" -ge 2 ]; then
+        wait_for_ready "test_p2p_run"
+        local all_ids
+        all_ids="$(seq -s, 0 $((GPU_COUNT-1)))"
+        save_raw p2p_bw_lat bash -c "CUDA_VISIBLE_DEVICES=${all_ids} '${CUDA_BIN_DIR}/p2pBandwidthLatencyTest' 2>&1"
+        log_ok "P2P带宽/延迟测试完成，详见 raw_data/p2p_bw_lat.txt"
+    elif [ -x "${CUDA_BIN_DIR}/topologyQuery" ]; then
+        save_raw cuda_topology_query "${CUDA_BIN_DIR}/topologyQuery"
+        log_info "p2pBandwidthLatencyTest 不可用或单卡，改用 topologyQuery"
+    else
+        log_warn "P2P测试程序不可用，只保留 nvidia-smi topo 输出"
+    fi
+}
+
+# ==================== 顺序30: test_cuda_perf() ====================
+test_cuda_perf() {
+    log_info "===== CUDA 算力性能测试 ====="
+    local CUDA_BIN_DIR
+    CUDA_BIN_DIR="$(cat "${CUDA_BIN_DIR_FILE}" 2>/dev/null || echo "")"
+    local GPU_COUNT
+    GPU_COUNT="$(cat "${GPU_COUNT_FILE}" 2>/dev/null || echo 0)"
+
+    if [ -x "${CUDA_BIN_DIR}/nbody" ]; then
+        wait_for_ready "test_cuda_perf_nbody"
+        save_raw cuda_nbody_fp64 "${CUDA_BIN_DIR}/nbody" -benchmark -fp64 -numdevices="${GPU_COUNT}" -numbodies=50000
+        local gflops
+        gflops="$(grep -iE 'GFLOP|gflop' "${RAW_DATA_DIR}/cuda_nbody_fp64.txt" 2>/dev/null | tail -n1 | grep -oE '[0-9]+\.[0-9]+' | head -n1 || echo N/A)"
+        log_info "nbody FP64 基准: ~${gflops} GFLOPS (多卡合计)"
+    else
+        log_warn "nbody 未编译"
+    fi
+
+    if [ -x "${CUDA_BIN_DIR}/matrixMul" ]; then
+        save_raw cuda_matrix_mul "${CUDA_BIN_DIR}/matrixMul" -wA=2048 -hA=2048 -wB=2048 -hB=2048
+        log_info "matrixMul 2048^3 已跑完，详见 raw_data/cuda_matrix_mul.txt"
+    fi
+}
+
+# ==================== 顺序31: test_stress_thermal() ====================
+test_stress_thermal() {
+    log_info "===== 压力+温度稳定性测试 (${STRESS_DURATION_SEC}s) ====="
+    local CUDA_BIN_DIR
+    CUDA_BIN_DIR="$(cat "${CUDA_BIN_DIR_FILE}" 2>/dev/null || echo "")"
+    local GPU_COUNT
+    GPU_COUNT="$(cat "${GPU_COUNT_FILE}" 2>/dev/null || echo 0)"
+
+    wait_for_ready "test_stress_thermal_start"
+
+    local trace_csv="${OUTPUT_DIR}/thermal_trace_all.csv"
+    echo "timestamp,gpu_idx,temp_C,power_W,sm_clock_MHz,mem_clock_MHz,util_pct" > "${trace_csv}"
+
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        (
+            local end_ts=$(( $(date +%s) + STRESS_DURATION_SEC + 10 ))
+            while [ "$(date +%s)" -lt "${end_ts}" ]; do
+                local ts
+                ts="$(date '+%Y-%m-%d %H:%M:%S')"
+                nvidia-smi --query-gpu=index,temperature.gpu,power.draw,clocks.current.sm,clocks.current.memory,utilization.gpu --format=csv,noheader,nounits 2>/dev/null | while IFS=',' read -r idx temp power sm_clk mem_clk util; do
+                    echo "${ts},${idx},${temp},${power},${sm_clk},${mem_clk},${util}" | tr -d ' ' >> "${trace_csv}"
+                done
+                sleep 10
+            done
+        ) &
+        local MONITOR_PID=$!
+    fi
+
+    if [ -x "${CUDA_BIN_DIR}/nbody" ]; then
+        log_info "启动 nbody 全卡压力（timeout $((STRESS_DURATION_SEC + 5))s）..."
+        ( timeout $((STRESS_DURATION_SEC + 5)) "${CUDA_BIN_DIR}/nbody" -benchmark -fp64 -numdevices="${GPU_COUNT}" -numbodies=999999 > "${RAW_DATA_DIR}/stress_nbody_full.log" 2>&1 || true ) &
+        local STRESS_PID=$!
+        wait "${STRESS_PID}" 2>/dev/null || true
+    elif command -v nvidia-smi >/dev/null 2>&1; then
+        log_warn "nbody 不可用，改用 nvidia-smi dmon 纯监控 + gpu_burn（若可用）"
+        local FACTORY_BIN
+        FACTORY_BIN="$(cat "${FACTORY_BIN_DIR_FILE}" 2>/dev/null || echo "")"
+        if [ -x "${FACTORY_BIN}/gpu_burn" ]; then
+            ( cd "${FACTORY_BIN}" && timeout $((STRESS_DURATION_SEC + 5)) ./gpu_burn "${STRESS_DURATION_SEC}" > "${RAW_DATA_DIR}/stress_gpuburn_full.log" 2>&1 || true ) &
+            local STRESS_PID=$!
+            wait "${STRESS_PID}" 2>/dev/null || true
+        else
+            sleep $((STRESS_DURATION_SEC + 2))
+        fi
+    else
+        sleep $((STRESS_DURATION_SEC + 2))
+    fi
+
+    [ -n "${MONITOR_PID}" ] && kill "${MONITOR_PID}" 2>/dev/null || true
+    wait 2>/dev/null || true
+
+    local peak_temp=0 avg_power=0 peak_clk=0 count=0 exceeded=0
+    if [ -f "${trace_csv}" ] && [ "$(wc -l < "${trace_csv}")" -gt 2 ]; then
+        local temps powers clocks
+        temps="$(tail -n +2 "${trace_csv}" 2>/dev/null | awk -F',' '{print $3}' | grep -E '^[0-9]+$' || echo 0)"
+        powers="$(tail -n +2 "${trace_csv}" 2>/dev/null | awk -F',' '{print $4}' | grep -E '^[0-9]+\.?[0-9]*$' || echo 0)"
+        clocks="$(tail -n +2 "${trace_csv}" 2>/dev/null | awk -F',' '{print $5}' | grep -E '^[0-9]+$' || echo 0)"
+        peak_temp="$(echo "${temps}" | sort -nr | head -n1 || echo 0)"
+        avg_power="$(echo "${powers}" | awk '{sum+=$1; n++} END {if(n>0) printf "%.0f", sum/n; else print 0}')"
+        peak_clk="$(echo "${clocks}" | sort -nr | head -n1 || echo 0)"
+        count="$(echo "${temps}" | wc -l || echo 0)"
+        exceeded="$(echo "${temps}" | awk -v t="${TEMP_ALARM_C}" '$1 >= t' | wc -l || echo 0)"
+    fi
+
+    save_raw thermal_trace_csv cat "${trace_csv}"
+
+    log_info "温度压力总结:"
+    log_info "  数据采样点    = ${count}"
+    log_info "  峰值温度      = ${peak_temp}°C (报警阈值=${TEMP_ALARM_C}°C)"
+    log_info "  超过阈值次数  = ${exceeded}"
+    log_info "  平均功耗      = ${avg_power} W"
+    log_info "  峰值SM频率    = ${peak_clk} MHz"
+
+    if [ "${peak_temp}" -lt "${TEMP_ALARM_C}" ] 2>/dev/null; then
+        log_ok "温度压力PASS ✅ 峰值 ${peak_temp}°C < ${TEMP_ALARM_C}°C"
+    else
+        log_warn "温度峰值触达/超过阈值 ${peak_temp}°C，但看门狗已确保恢复后继续（有${exceeded}个采样点超阈值）"
+    fi
+}
+
+# ==================== 顺序32: test_dcgm() ====================
+test_dcgm() {
+    log_info "===== NVIDIA DCGM 诊断 ====="
+    local GPU_COUNT
+    GPU_COUNT="$(cat "${GPU_COUNT_FILE}" 2>/dev/null || echo 0)"
+
+    if ! command -v dcgmi >/dev/null 2>&1; then
+        log_warn "dcgmi 不可用，使用 nvidia-smi -q 替代诊断"
+        save_raw nvidia_smi_q_full nvidia-smi -q
+        return 0
+    fi
+
+    save_raw dcgmi_discovery dcgmi discovery -l
+    sudo systemctl is-active --quiet nvidia-dcgm.service 2>/dev/null || sudo systemctl start nvidia-dcgm.service 2>/dev/null || true
+    sleep 1
+
+    local i=0
+    for i in $(seq 0 $((GPU_COUNT-1))); do
+        wait_for_ready "test_dcgm_gpu${i}"
+        log_info "GPU${i}: 运行 dcgmi diag '3. Quick' (快速诊断)"
+        save_raw "dcgmi_diag_gpu${i}" dcgmi diag -r "${i}" -p 1
+        local diag_out="${RAW_DATA_DIR}/dcgmi_diag_gpu${i}.txt"
+        if grep -qiE "PASS|success|Success" "${diag_out}" 2>/dev/null; then
+            log_ok "GPU${i}: DCGM diag PASS ✅"
+        else
+            log_warn "GPU${i}: DCGM diag 结果异常，详见 ${diag_out}"
+        fi
+
+        save_raw "dcgmi_stats_gpu${i}" dcgmi stats -g "${i}" -d
+        local retired
+        retired="$(grep -iE 'Retired|retired' "${RAW_DATA_DIR}/dcgmi_stats_gpu${i}.txt" 2>/dev/null | grep -oE '[0-9]+' | head -n1 || echo 0)"
+        if [ "${retired}" -gt 0 ] 2>/dev/null; then
+            log_error "GPU${i}: ❗️ DCGM Retired Pages=${retired} > 0 = 显存物理坏块标记 = 必须RMA更换！"
+        else
+            log_info "GPU${i}: DCGM Retired Pages=0 ✅"
+        fi
+    done
+}
+
+# ==================== 顺序33: test_fieldiag() ====================
+test_fieldiag() {
+    log_info "===== NVIDIA 原厂 fieldiag 诊断 ====="
+    local DC_GPU_LIST="H100 H200 H800 H900 B200 B300 B380 B390 GB200 GB300 A100 A800 A900 A30 A10 A10G T4 T4g L4 L40 L40S V100 V100S P100 P40 P4 K80 K40 M60 M40 A2 L20 L2 L10 L10G PG500 PG506 PG509 HGX DGX Tesla GRID Quadro RTX GV100 GP100"
+    local f_bin=""
+    for p in /usr/local/cuda/bin/fieldiag /opt/nvidia/fieldiag/bin/fieldiag /usr/bin/fieldiag "${SCRIPT_DIR}/fieldiag"; do
+        if [ -x "${p}" ]; then f_bin="${p}"; break; fi
+    done
+    [ -z "${f_bin}" ] && f_bin="$(command -v fieldiag 2>/dev/null || echo "")"
+    [ -n "${f_bin}" ] && [ ! -x "${f_bin}" ] && f_bin=""
+
+    local GPU_COUNT
+    GPU_COUNT="$(cat "${GPU_COUNT_FILE}" 2>/dev/null || echo 0)"
+    local have_dc_gpu=false
+    local i=0
+    for i in $(seq 0 $((GPU_COUNT-1))); do
+        local gname
+        gname="$(nvidia-smi --query-gpu=name --format=csv,noheader -i "${i}" 2>/dev/null || echo UNKNOWN)"
+        for g in ${DC_GPU_LIST}; do
+            if echo "${gname}" | grep -qi "${g}"; then have_dc_gpu=true; break 2; fi
+        done
+    done
+
+    if [ -z "${f_bin}" ] || [ "${have_dc_gpu}" = "false" ]; then
+        local status=""
+        if [ -z "${f_bin}" ] && [ "${have_dc_gpu}" = "false" ]; then
+            status="SKIPPED_NOT_FOUND_AND_CONSUMER_GPU"
+        elif [ -z "${f_bin}" ]; then
+            status="SKIPPED_NOT_FOUND"
+        else
+            status="CONSUMER_GPU_SKIPPED"
+        fi
+        log_info "ℹ️  未找到fieldiag或非数据中心GPU，自动跳过原厂诊断，PCIe/温度等其他检测已完整执行"
+        echo "status=${status}" > "${FIELDIAG_RESULT_FILE}"
+        echo "fieldiag_binary=${f_bin}" >> "${FIELDIAG_RESULT_FILE}"
+        echo "have_datacenter_gpu=${have_dc_gpu}" >> "${FIELDIAG_RESULT_FILE}"
+        return 0
+    fi
+
+    echo "status=RUNNING" > "${FIELDIAG_RESULT_FILE}"
+    echo "fieldiag_binary=${f_bin}" >> "${FIELDIAG_RESULT_FILE}"
+    echo "level=${FIELD_LEVEL}" >> "${FIELDIAG_RESULT_FILE}"
+    log_ok "检测到 fieldiag 二进制: ${f_bin}"
+    log_ok "检测到数据中心级GPU，开始 Level=${FIELD_LEVEL} 原厂诊断..."
+
+    if [ "${FORCE_FIELDIAG}" != "true" ]; then
+        log_info "先执行 fieldiag 预检 (Level 0..6)"
+        local precheck_ok=true
+        local pl=0
+        for pl in 0 1 2 3 4 5 6; do
+            wait_for_ready "fieldiag_precheck_${pl}"
+            local pout="${RAW_DATA_DIR}/fieldiag_precheck_L${pl}.log"
+            ( "${f_bin}" -l "${pl}" > "${pout}" 2>&1 ) || true
+            if grep -qiE "FAIL|ERROR|Failed" "${pout}" 2>/dev/null; then
+                log_warn "fieldiag 预检 Level ${pl} 有告警（可查看 ${pout}）"
+            fi
+        done
+    else
+        log_info "FORCE_FIELDIAG=true，跳过预检直接进入 Level=${FIELD_LEVEL}"
+    fi
+
+    wait_for_ready "fieldiag_level_${FIELD_LEVEL}"
+    log_warn "🚨 fieldiag Level=${FIELD_LEVEL} 开始，可能持续 5分钟~1小时，请勿中断..."
+    local main_out="${RAW_DATA_DIR}/fieldiag.log"
+    ( "${f_bin}" -l "${FIELD_LEVEL}" > "${main_out}" 2>&1 ) || true
+    save_raw fieldiag_raw cat "${main_out}"
+
+    log_info "fieldiag 结果摘要:"
+    grep -iE "PASS|FAIL|ERROR|completed|Result|Summary" "${main_out}" 2>/dev/null | tee -a "${LOG_FILE}" || echo "  (无匹配摘要，详见 raw_data/fieldiag.log)" | tee -a "${LOG_FILE}"
+
+    if grep -qiE "PASS|completed successfully" "${main_out}" 2>/dev/null; then
+        echo "status=PASS" > "${FIELDIAG_RESULT_FILE}"
+        log_ok "fieldiag Level=${FIELD_LEVEL} PASS ✅"
+    elif grep -qiE "FAIL|ERROR" "${main_out}" 2>/dev/null; then
+        echo "status=FAIL" > "${FIELDIAG_RESULT_FILE}"
+        log_warn "fieldiag Level=${FIELD_LEVEL} 检出 FAIL/ERROR，详见 raw_data/fieldiag.log"
+    else
+        echo "status=UNKNOWN" > "${FIELDIAG_RESULT_FILE}"
+        log_info "fieldiag 结果 UNKNOWN（需人工查看 raw_data/fieldiag.log）"
+    fi
+}
+
+# ==================== 顺序34: generate_final_report() ====================
+generate_final_report() {
+    log_info "===== 生成最终报告 ====="
+    local end_ts
+    end_ts="$(date +%Y-%m-%d_%H:%M:%S)"
+    local start="${TS_START//_/ }"
+    start="${start:0:4}-${start:4:2}-${start:6:2} ${start:9:2}:${start:11:2}:${start:13:2}"
+
+    if [ ! -f "${REPORT_DATA_JSON}" ]; then
+        local net_status="${NET_REACHABLE_CACHED:-unknown}"
+        local raw_files=""
+        [ -d "${RAW_DATA_DIR}" ] && raw_files="$(ls -1 "${RAW_DATA_DIR}" 2>/dev/null | tr '\n' ' ')"
+        cat > "${REPORT_DATA_JSON}" <<EOF
+{
+  "summary_status": "COMPLETED",
+  "start_ts": "${start}",
+  "end_ts": "${end_ts}",
+  "run_config": {
+    "CUDA_VERSION": "${CUDA_VERSION}",
+    "STRESS_DURATION_SEC": ${STRESS_DURATION_SEC},
+    "GPUBURN_DURATION_SEC": ${GPUBURN_DURATION_SEC},
+    "FIELD_LEVEL": ${FIELD_LEVEL},
+    "TEMP_ALARM_C": ${TEMP_ALARM_C},
+    "TEMP_COOLDOWN_C": ${TEMP_COOLDOWN_C},
+    "SKIP_INSTALL": ${SKIP_INSTALL},
+    "STRESS_ONLY": ${STRESS_ONLY}
+  },
+  "gpus_found_from_lspci": "$(lspci 2>/dev/null | grep -i nvidia | wc -l || echo 0)",
+  "apt_segfault": false,
+  "network_reachable": "${net_status}",
+  "raw_data_files": "${raw_files}"
+}
+EOF
+    fi
+
+    if [ -f "${SCRIPT_DIR}/generate_report.py" ]; then
+        log_info "调用 generate_report.py 生成 report.html ..."
+        ( python3 "${SCRIPT_DIR}/generate_report.py" --output_dir "${OUTPUT_DIR}" --raw_data_dir "${RAW_DATA_DIR}" --log_file "${LOG_FILE}" ) 2>&1 | tee -a "${LOG_FILE}" || true
+        if [ -f "${OUTPUT_DIR}/report.html" ]; then
+            log_ok "✅ 最终报告已生成: ${OUTPUT_DIR}/report.html"
+        else
+            log_warn "generate_report.py 未产出 report.html，但 raw_data + test.log 已完整"
+        fi
+    else
+        log_warn "未找到 generate_report.py，跳过HTML报告生成"
+        log_info "但所有原始数据已保存在: ${RAW_DATA_DIR}/"
+        log_info "完整测试日志: ${LOG_FILE}"
+        log_info "可手动打包 ${OUTPUT_DIR} 目录提交RMA"
+    fi
+}
+
+# ==================== 顺序35: main() ====================
+main() {
+    local positional=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --skip-install)     SKIP_INSTALL=true; shift ;;
+            --stress-only)      STRESS_ONLY=true; shift ;;
+            --field-level)      FIELD_LEVEL="$2"; shift 2 ;;
+            --field-level=*)    FIELD_LEVEL="${1#*=}"; shift ;;
+            --gpuburn-time)     GPUBURN_DURATION_SEC="$2"; shift 2 ;;
+            --gpuburn-time=*)   GPUBURN_DURATION_SEC="${1#*=}"; shift ;;
+            --force-fieldiag)   FORCE_FIELDIAG=true; shift ;;
+            -h|--help)
+                echo "用法: $0 [选项]"
+                echo "  --skip-install       跳过依赖/驱动/CUDA/DCGM下载安装（只跑测试）"
+                echo "  --stress-only        仅执行依赖/驱动/枚举/压力+报告（快速模式）"
+                echo "  --field-level N      fieldiag 诊断级别 0~3（默认1）"
+                echo "  --gpuburn-time N     gpu-burn 秒数（默认120）"
+                echo "  --force-fieldiag     跳过 fieldiag 预检直接跑主级别"
+                echo "  -h, --help           显示此帮助"
                 exit 0
+                ;;
+            *)
+                positional+=("$1")
+                shift
                 ;;
         esac
     done
+    set -- "${positional[@]}"
 
-    # ================================================================
-    # 启动交互菜单：无命令行参数时显示（售后服务工程师最常用模式）
-    # 覆盖：fieldiag等级、压力时长、温度报警阈值、冷却阈值
-    # ================================================================
-    if [ $# -eq 0 ]; then
+    if [ "$#" -eq 0 ] && [ "${SKIP_INSTALL}" = "false" ] && [ "${STRESS_ONLY}" = "false" ] && [ "${FIELD_LEVEL}" = "1" ] && [ "${GPUBURN_DURATION_SEC}" = "120" ] && [ "${FORCE_FIELDIAG}" = "false" ]; then
         interactive_menu
     fi
 
     init
-    log_info "输出目录: ${OUTPUT_DIR}"
-    log_info "参数设置: fieldiag等级=Level ${FIELD_LEVEL} | nbody压力=${STRESS_DURATION_SEC}秒 | gpu-burn=${GPUBURN_DURATION_SEC}秒/卡 | 温度报警=${TEMP_ALARM_C}℃ | 冷却恢复=${TEMP_COOLDOWN_C}℃"
-    # 写入配置供报告查阅
-    {
-        echo "fieldiag_level: Level ${FIELD_LEVEL}"
-        echo "stress_duration_sec: ${STRESS_DURATION_SEC}"
-        echo "gpuburn_duration_sec: ${GPUBURN_DURATION_SEC}"
-        echo "temp_alarm_c: ${TEMP_ALARM_C}"
-        echo "temp_cooldown_c: ${TEMP_COOLDOWN_C}"
-        echo "force_fieldiag: ${FORCE_FIELDIAG}"
-        echo "skip_install: ${skip_install}"
-        echo "stress_only: ${stress_only}"
-        echo "start_ts: $(date '+%Y-%m-%d %H:%M:%S')"
-    } > "${OUTPUT_DIR}/run_config.yml"
-    log_info "手动暂停: 另开终端运行 touch ${OUTPUT_DIR}/.manual_pause"
-    log_info "手动恢复: 另开终端运行 rm   -f  ${OUTPUT_DIR}/.manual_pause"
 
-    # 启动温度守护进程（此时PAUSE_MARKER路径已在init()内设置好）
+    log_info "======================================"
+    log_info "输出目录 : ${OUTPUT_DIR}"
+    log_info "日志文件 : ${LOG_FILE}"
+    log_info "配置: stress=${STRESS_DURATION_SEC}s  gpuburn=${GPUBURN_DURATION_SEC}s  fieldiag=L${FIELD_LEVEL}  temp_alarm=${TEMP_ALARM_C}°C"
+    log_info "开关: skip_install=${SKIP_INSTALL}  stress_only=${STRESS_ONLY}  force_fieldiag=${FORCE_FIELDIAG}"
+    log_info "======================================"
+
+    cat > "${RUN_CONFIG_FILE}" <<EOF
+run_config:
+  cuda_version: "${CUDA_VERSION}"
+  stress_duration_sec: ${STRESS_DURATION_SEC}
+  gpuburn_duration_sec: ${GPUBURN_DURATION_SEC}
+  field_level: ${FIELD_LEVEL}
+  temp_alarm_c: ${TEMP_ALARM_C}
+  temp_cooldown_c: ${TEMP_COOLDOWN_C}
+  skip_install: ${SKIP_INSTALL}
+  stress_only: ${STRESS_ONLY}
+  force_fieldiag: ${FORCE_FIELDIAG}
+  output_dir: "${OUTPUT_DIR}"
+  log_file: "${LOG_FILE}"
+EOF
+
+    log_info "=== 手动暂停/恢复命令 ==="
+    log_info "  手动立即暂停所有测试:   touch ${MANUAL_PAUSE}"
+    log_info "  手动恢复:                rm -f ${MANUAL_PAUSE}"
+    log_info "  温度报警自动暂停标记:    ${PAUSE_MARKER}（达到冷却自动删除）"
+    log_info "  查看看门狗实时温度:      tail -f ${TEMP_LOG}"
+    log_info "=========================="
+
     start_temp_watchdog
 
-    if [ "${stress_only}" = "true" ]; then
+    if [ "${STRESS_ONLY}" = "true" ]; then
+        log_warn "模式: STRESS_ONLY（仅依赖/驱动/枚举/压力/报告，跳过大部分子测试）"
         install_system_deps
         check_system
-        check_nvidia_driver
+        check_nvidia_driver || true
         enumerate_gpus
-        install_cuda_toolkit
+        install_cuda_toolkit || true
         test_stress_thermal
         generate_final_report
-        exit 0
+        log_ok "STRESS_ONLY 模式全部完成 🎉"
+        log_ok "报告目录: ${OUTPUT_DIR}"
+        log_info "提交RMA: 打包整个目录 tar czf gpu_report_${TS_START}.tar.gz ${OUTPUT_DIR}"
+        return 0
     fi
 
-    if [ "${skip_install}" = "false" ]; then
+    if [ "${SKIP_INSTALL}" = "false" ]; then
+        log_info "模式: 完整安装 + 测试"
         install_system_deps
         check_system
-        check_nvidia_driver
-        install_cuda_toolkit
-        install_dcgm
-        install_factory_tools   # 4.5 下载编译 gpu-burn + cuda_memtest
+        check_nvidia_driver || true
+        install_cuda_toolkit || true
+        install_dcgm || true
+        install_factory_tools
     else
+        log_info "模式: SKIP_INSTALL（跳过apt安装，假设依赖已就位）"
         install_system_deps
         check_system
-        check_nvidia_driver
-        # 检查CUDA可用性
-        export PATH="/usr/local/cuda/bin:${PATH}"
-        export LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH}"
-        if command -v nvcc &>/dev/null; then
+        check_nvidia_driver || true
+        if command -v nvcc >/dev/null 2>&1; then
             compile_cuda_samples
         fi
         install_factory_tools
     fi
 
-    # ============== 测试阶段 ==============
-    enumerate_gpus            # 5. 门禁
-    test_pcie_link            # 14. PCIe链路状态
-    test_device_query         # 6. deviceQuery
-    test_ecc                  # 12. ECC
-    test_factory_validation   # 12.5 原厂现场质检（Field Validation）
-    test_memory               # 13. 显存主动校验（cuda_memtest 10种模式）
-    test_gpu_burn             # 13.5 满载烧机+正确性校验（gpu-burn）
-    test_bandwidth            # 7. PCIe带宽
-    test_p2p                  # 8. P2P
-    test_cuda_perf            # 9. 计算性能
-    test_stress_thermal       # 10. 温度功耗压力
-    test_dcgm                 # 11. DCGM 完整诊断
-    test_fieldiag             # 11.5 fieldiag 原厂现场诊断
+    log_info "======== 测试阶段开始 ========"
+    enumerate_gpus
+    test_pcie_link
+    test_device_query
+    test_ecc
+    test_factory_validation
+    test_memory
+    test_gpu_burn
+    test_bandwidth
+    test_p2p
+    test_cuda_perf
+    test_stress_thermal
+    test_dcgm
+    test_fieldiag
 
-    # ============== 生成报告 ==============
-    generate_final_report   # 15.
+    generate_final_report
 
-    log_ok "========== 全部测试完成 =========="
-    log_ok "报告目录: ${OUTPUT_DIR}"
-    log_ok "请将 report.html 和 report_data.json 一并提交存档"
+    log_ok "======================================"
+    log_ok "🎉 NVIDIA GPU 售后自动化测试全部完成！"
+    log_ok "======================================"
+    log_ok "最终报告 : ${OUTPUT_DIR}/report.html"
+    log_ok "测试日志 : ${LOG_FILE}"
+    log_ok "原始数据 : ${RAW_DATA_DIR}/"
+    log_info "提交RMA命令: tar czf gpu_test_report_${TS_START}.tar.gz ${OUTPUT_DIR}"
 }
 
-main "$@"
+# ==================== 顺序36: 最外层安全壳执行 ====================
+WRAPPER_RC=0
+(
+  main "$@"
+) || WRAPPER_RC=$?
+
+if [ -n "${WATCHDOG_BG_PID}" ] && kill -0 "${WATCHDOG_BG_PID}" 2>/dev/null; then
+    kill "${WATCHDOG_BG_PID}" 2>/dev/null || true
+fi
+if [ -f "${WATCHDOG_PID_FILE}" ]; then
+    local_wpid="$(cat "${WATCHDOG_PID_FILE}" 2>/dev/null || true)"
+    [ -n "${local_wpid}" ] && kill "${local_wpid}" 2>/dev/null || true
+fi
+pkill -f "watchdog_temp.log" 2>/dev/null || true
+
+if [ "${WRAPPER_RC}" -eq 0 ]; then
+  echo ""
+  echo -e "${GREEN}✅ 脚本正常结束${NC}"
+else
+  echo ""
+  echo -e "${YELLOW}⚠️  脚本内部遇到非零退出码(${WRAPPER_RC})，但已被外壳隔离${NC}"
+  echo -e "${YELLOW}    请查看日志: ${LOG_FILE}${NC}"
+  if [ -f "${OUTPUT_DIR}/test.log" ] && [ -f "${SCRIPT_DIR}/generate_report.py" ]; then
+    echo -e "${BLUE}尝试生成失败原因诊断报告...${NC}"
+    ( python3 "${SCRIPT_DIR}/generate_report.py" --output_dir "${OUTPUT_DIR}" --raw_data_dir "${RAW_DATA_DIR}" --log_file "${LOG_FILE}" >/dev/null 2>&1 ) || true
+    if [ -f "${OUTPUT_DIR}/report.html" ]; then
+      echo -e "${GREEN}✅ 报告已生成: ${OUTPUT_DIR}/report.html${NC}"
+    fi
+  fi
+fi
+echo -e "${BLUE}所有输出目录: ${OUTPUT_DIR}${NC}"
+exit 0
