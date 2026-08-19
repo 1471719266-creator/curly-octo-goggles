@@ -393,57 +393,42 @@ auto_install_driver_cuda_runfile() {
     fi
     chmod +x "${runfile_path}" 2>/dev/null || true
 
-    # ── 3. 关闭 nouveau 开源驱动 + 写入黑名单（防止和官方驱动抢设备）──
-    #    ★★ 高风险操作保护 ★★
-    #    - 先备份 initrd.img
-    #    - 验证 /boot/vmlinuz-$(uname -r) 和 initrd.img 是否都存在、大小正常
-    #    - 一旦 update-initramfs 失败立刻还原备份、绝对不主动 reboot
-    #    - 如检测到正在 dist-upgrade / 内核包替换期间 → 只写黑名单，不重建 initramfs（延后到下一次正常启动）
+    # ── 3. 关闭 nouveau 开源驱动（★ 彻底无重启安全路线 ★）
+    #    之前出过「update-initramfs 写坏 initrd → 重启掉 BusyBox initramfs」的严重事故，
+    #    从现在开始：
+    #     ✅ 只写 /etc/modprobe.d/blacklist-nouveau.conf 文本（安全，只是个配置文件）
+    #     ❌ 绝对不调用 update-initramfs（不碰 /boot/initrd.img）
+    #     ❌ 绝对不主动建议用户 reboot（除非明确说「我知道风险我要重启」）
+    #     ✅ 改用「nouveau PCI unbind + modprobe nvidia」动态切换驱动，无需重启
     if lsmod 2>/dev/null | grep -q nouveau; then
-        log_info "🔧 检测到 nouveau 开源驱动正在运行，写入黑名单..."
-        local initramfs_safe=true
-        local running_kver=""
-        running_kver="$(uname -r)"
-        # 安全条件1：正在进行的 apt/dpkg 进程不能存在
-        if pidof apt-get apt dpkg >/dev/null 2>&1; then
-            log_warn "⚠️  检测到 apt/dpkg 进程仍在运行（可能在 dist-upgrade 或内核替换中），本阶段不重建 initramfs，避免破坏 initrd"
-            initramfs_safe=false
-        fi
-        # 安全条件2：/boot 下当前内核的 vmlinuz 和 initrd 必须齐全
-        if [ ! -f "/boot/vmlinuz-${running_kver}" ] || [ ! -f "/boot/initrd.img-${running_kver}" ]; then
-            log_warn "⚠️  /boot 下当前内核(${running_kver})的 vmlinuz/initrd 缺失，重建 initramfs 风险极高，跳过重建"
-            initramfs_safe=false
-        fi
-        # 安全条件3：磁盘空间够（/boot < 20% 可用就不搞）
-        local boot_avail
-        boot_avail="$(df -k /boot 2>/dev/null | awk 'NR==2 {print $4}' || echo 0)"
-        if [ -n "${boot_avail}" ] && [ "${boot_avail}" -lt 102400 ]; then  # <100MB
-            log_warn "⚠️  /boot 可用空间不足 ${boot_avail} KB，重建 initramfs 可能写坏 initrd，跳过重建"
-            initramfs_safe=false
-        fi
-
-        # 写黑名单配置（这个操作是安全的，只是一个文本文件，不影响当前内核）
+        log_info "🔧 检测到 nouveau 开源驱动正在运行，写入黑名单配置（不重建 initrd，不重启）"
         sudo tee /etc/modprobe.d/blacklist-nouveau.conf >/dev/null <<'EOF'
 blacklist nouveau
 options nouveau modeset=0
 EOF
+        # 写 update-initramfs 的钩子注释：让以后系统自然 apt upgrade 触发 initrd 重建时再把黑名单塞进去
+        # 我们这里**绝对不主动触发重建**
+        log_info "  黑名单配置已写入。为避免破坏 initrd 导致无法启动，暂不重建 initramfs。"
+        log_info "  下面将通过【nouveau unbind → modprobe nvidia】路线动态切换驱动（无需重启）"
 
-        if [ "${initramfs_safe}" = "true" ]; then
-            log_info "📦 安全条件通过：先备份当前 initrd.img-${running_kver}，再重建 initramfs"
-            ( sudo cp -a "/boot/initrd.img-${running_kver}" "/boot/initrd.img-${running_kver}.gpu_test_bak_$(date +%Y%m%d_%H%M%S)" 2>&1 | tee -a "${LOG_FILE}" ) || true
-            local uif_rc=0
-            sudo update-initramfs -u -k "${running_kver}" 2>&1 | tee -a "${LOG_FILE}" || uif_rc=$?
-            if [ "${uif_rc}" -ne 0 ] || [ ! -s "/boot/initrd.img-${running_kver}" ]; then
-                log_error "❌ update-initramfs 失败！立刻还原 initrd 备份，阻止可能的无法启动"
-                ( sudo cp -a "/boot/initrd.img-${running_kver}.gpu_test_bak_"* "/boot/initrd.img-${running_kver}" 2>&1 | tee -a "${LOG_FILE}" ) || true
-                log_warn "⚠️  nouveau 黑名单只写入了 /etc/modprobe.d 但没进 initrd，下次正常 apt upgrade 时会自动补重建"
-            else
-                log_ok "✅ initramfs 重建成功，nouveau 已加入黑名单（驱动安装完成后需要 reboot 才能完全生效）"
+        # ── 立刻执行动态切换：把所有 NVIDIA PCI 设备从 nouveau 驱动上解绑 ──
+        log_info "🔓 动态解绑 nouveau 驱动（不重启）..."
+        local pci_list=""
+        pci_list="$(lspci -d 10de: -MM 2>/dev/null | awk '{print $1}' || true)"
+        local bdf
+        local unbind_count=0
+        for bdf in ${pci_list}; do
+            if [ -L "/sys/bus/pci/drivers/nouveau/${bdf}" ]; then
+                log_info "   解绑设备 ${bdf} 从 nouveau ..."
+                ( sudo sh -c "echo '${bdf}' > /sys/bus/pci/drivers/nouveau/unbind" 2>&1 | tee -a "${LOG_FILE}" ) || true
+                unbind_count=$((unbind_count + 1))
             fi
+        done
+        if [ "${unbind_count}" -gt 0 ]; then
+            log_ok "✅ ${unbind_count} 块 GPU 已从 nouveau 解绑，接下来驱动安装完后直接 modprobe nvidia 就能接管"
         else
-            log_warn "⚠️  只写了 /etc/modprobe.d/blacklist-nouveau.conf，未立刻重建 initrd（等下次自然升级时自动重建更安全）"
+            log_info "  没有 GPU 当前挂在 nouveau 上（可能已经被黑了或者被别的驱动接了），正常继续"
         fi
-        log_warn "💡 提示：驱动安装完成后确实需要 reboot 才会禁用 nouveau，但不要在 apt/dpkg 还没结束时重启！"
     fi
 
     # ── 4. 检测图形界面（X/Wayland），决定是否切 tty ──
