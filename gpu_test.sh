@@ -163,7 +163,7 @@ fix_apt_sources() {
     local need_fix=false
     local probe_out=""
     probe_out="$(sudo timeout 60 apt-get update 2>&1 || true)"
-    if echo "${probe_out}" | grep -qE '404[[:space:]]+Not Found|does not have a Release file|no longer has a Release file|is not available|held broken packages|unmet dependencies|Depends: .* but it is not installable'; then
+    if echo "${probe_out}" | grep -qE '404[[:space:]]+Not Found|does not have a Release file|no longer has a Release file|is not available|held broken packages|unmet dependencies|Depends: .* but it is not installable|Could not resolve .*download\.nvidia\.com|nobleoper\.download\.nvidia\.com'; then
         need_fix=true
     fi
     # 兜底：如果版本代号本身就是已知失效版（oracular=24.10 interim）直接修
@@ -173,7 +173,11 @@ fix_apt_sources() {
         oracular|mantic|lunar|kinetic|plucky|devel)  need_fix=true ;;
     esac
     # PPA codename 检查：sources.list.d 里有没有 oracular/mantic 等失效代号
-    if grep -rnE 'ubuntu +(oracular|mantic|lunar|kinetic|plucky|devel) ' /etc/apt/sources.list.d/ >/dev/null 2>&1; then
+    if grep -rnE 'ubuntu +(oracular|mantic|lunar|kinetic|plucky) ' /etc/apt/sources.list.d/ >/dev/null 2>&1; then
+        need_fix=true
+    fi
+    # 【关键】检测 NVIDIA CUDA repo 被之前 bug 弄坏的情况（devel 误替换导致 nobleoper）
+    if grep -rnE 'nobleoper\.download\.nvidia\.com|ubuntu(oracular|mantic|lunar|kinetic|plucky)' /etc/apt/sources.list.d/ >/dev/null 2>&1; then
         need_fix=true
     fi
 
@@ -187,7 +191,7 @@ fix_apt_sources() {
     # ═══════════════════════════════════════════════════════
     # Phase 0: 先清 APT/dpkg 锁 + held packages + 基础自愈
     # ═══════════════════════════════════════════════════════
-    log_info "[Phase 0/7] 清理锁文件 + held packages + dpkg自愈"
+    log_info "[Phase 0/8] 清理锁文件 + held packages + dpkg自愈"
     sudo rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock 2>/dev/null || true
     # 清所有 held packages（held 会导致"you have held broken packages"）
     ( sudo apt-mark unhold $(sudo apt-mark showhold 2>/dev/null || true) 2>/dev/null ) || true
@@ -198,39 +202,55 @@ fix_apt_sources() {
     local bak="/etc/apt/sources.list.gpu_test_bak_$(date +%Y%m%d_%H%M%S)"
     sudo cp -a /etc/apt/sources.list "${bak}" 2>/dev/null || true
     log_info "原 sources.list 已备份到: ${bak}"
+    # 把 sources.list.d 也整体备份一下
+    if [ -d /etc/apt/sources.list.d ]; then
+        sudo cp -a /etc/apt/sources.list.d "/etc/apt/sources.list.d.gpu_test_bak_$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
+    fi
 
     # ═══════════════════════════════════════════════════════
-    # Phase 1: sources.list.d/*.list 和 .sources 修复
-    #   - 删掉 ubuntu 官方源（hk.archive等）行，保留第三方PPA
-    #   - ★ 关键：把 PPA URL 里 oracular/mantic/... → noble 替换！
+    # Phase 1: 【关键】删除所有 NVIDIA/CUDA/DCGM 的 apt 源
+    #   —— 彻底避免域名误替换（nobleoper）和 ubuntuoracular 路径问题
+    #   —— 驱动+CUDA 统一走 .run 直装路线（更稳定，不依赖apt）
     # ═══════════════════════════════════════════════════════
-    log_info "[Phase 1/7] 修复 sources.list.d/ PPA 源（codename 失效代号 → noble）"
-    local d_list=""
-    local BAD_CODENAMES_REGEX='(oracular|mantic|lunar|kinetic|plucky|devel|groovy|hirsute|impish|jammy-backports)'
-    # 使用 shopt nullglob 防止 glob 不匹配时返回原始字符串
+    log_info "[Phase 1/8] 删除 NVIDIA/CUDA/DCGM 的 apt 源（统一改用 .run 直装，避免域名误替换 bug）"
     local _nullglob_was_on=false
     shopt -q nullglob && _nullglob_was_on=true
     shopt -s nullglob
+    local d_list=""
     for d_list in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
         [ -f "${d_list}" ] || continue
-        # a) 删 ubuntu 官方源行，保留 graphics-drivers / nvidia-cuda / dcgm 等第三方 PPA
+        # 检测是不是 NVIDIA/CUDA/DCGM 的源，是的话直接整个删掉
+        if grep -qiE 'nvidia|cuda|dcgm' "${d_list}" 2>/dev/null; then
+            log_info "  删除 NVIDIA 相关源文件: $(basename "${d_list}")"
+            sudo rm -f "${d_list}" 2>/dev/null || true
+            continue
+        fi
+        # 删 ubuntu 官方源行，保留 graphics-drivers 等第三方 PPA
         sudo sed -i -E '/(archive|security|hk\.|cn\.|tw\.|jp\.)\.ubuntu\.com/d' "${d_list}" 2>/dev/null || true
-        # b) ★ 把 PPA URL 里的 oracular/mantic/lunar/... 统一替换成 noble
-        #    .list 格式: deb http://xxx/ubuntu oracular main
-        #    .sources 格式: Suites: oracular
-        sudo sed -i -E "s/${BAD_CODENAMES_REGEX}/noble/g" "${d_list}" 2>/dev/null || true
+        # b) ★ 安全的 codename 替换：
+        #    模式1: .list 格式 —— "deb URL/ubuntu <codename> main"
+        #    模式2: .sources 格式 —— "Suites: <codename>"
+        #    ★ 注意：使用 ^ 行首或 Suites: 或 /ubuntu 前缀，绝不匹配 developer 域名中的 devel！
+        #    先移除 BAD_REGEX 中的 devel（风险太大）
+        sudo sed -i -E \
+            -e 's@(/ubuntu[[:space:]]+)(oracular|mantic|lunar|kinetic|plucky|groovy|hirsute|impish)@\1noble@g' \
+            -e 's@(Suites:[[:space:]]*)(oracular|mantic|lunar|kinetic|plucky|groovy|hirsute|impish|jammy-backports)@\1noble@g' \
+            "${d_list}" 2>/dev/null || true
     done
-    # 恢复 nullglob 原始状态
     if [ "${_nullglob_was_on}" = "false" ]; then
         shopt -u nullglob 2>/dev/null || true
     fi
     sudo rm -f /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
-    log_ok "sources.list.d/ PPA codename 失效代号已统一替换为 noble"
+    # 也删除 cuda-keyring list （如果有的话）
+    sudo rm -f /etc/apt/sources.list.d/cuda*.list /etc/apt/sources.list.d/cuda*.sources 2>/dev/null || true
+    # 删除 dcgm list
+    sudo rm -f /etc/apt/sources.list.d/dcgm*.list /etc/apt/sources.list.d/dcgm*.sources 2>/dev/null || true
+    log_ok "sources.list.d/ 已清理：NVIDIA apt 源全删除，第三方 PPA codename 安全替换"
 
     # ═══════════════════════════════════════════════════════
     # Phase 2: 写入新 sources.list
     # ═══════════════════════════════════════════════════════
-    log_info "[Phase 2/7] 写入新 sources.list（清华 noble 24.04 LTS）"
+    log_info "[Phase 2/8] 写入新 sources.list（清华 noble 24.04 LTS）"
     sudo tee /etc/apt/sources.list >/dev/null 2>&1 <<'APT_EOF'
 deb https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ noble main restricted universe multiverse
 deb https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ noble-updates main restricted universe multiverse
@@ -252,7 +272,7 @@ APT_EOF
     # ═══════════════════════════════════════════════════════
     # Phase 3: 清缓存 + apt update
     # ═══════════════════════════════════════════════════════
-    log_info "[Phase 3/7] 清 APT 缓存 + apt update"
+    log_info "[Phase 3/8] 清 APT 缓存 + apt update"
     sudo rm -rf /var/lib/apt/lists/* 2>/dev/null || true
     sudo mkdir -p /var/lib/apt/lists/partial 2>/dev/null || true
     local rc=0
@@ -262,42 +282,52 @@ APT_EOF
     # Phase 4: 如有 update 错误 → 再一次 dpkg + -f install
     # ═══════════════════════════════════════════════════════
     if [ "${rc}" -ne 0 ]; then
-        log_warn "[Phase 4/7] apt update 第一次失败，尝试 dpkg --configure + -f install + 再update"
+        log_warn "[Phase 4/8] apt update 第一次失败，尝试 dpkg --configure + -f install + 再update"
         ( sudo dpkg --configure -a --force-confdef --force-confold 2>&1 | tee -a "${LOG_FILE}" ) || true
         ( sudo DEBIAN_FRONTEND=noninteractive apt-get install -f -y --fix-broken --fix-missing 2>&1 | tee -a "${LOG_FILE}" ) || true
         sudo DEBIAN_FRONTEND=noninteractive apt-get update --fix-missing 2>&1 | tee -a "${LOG_FILE}" || rc=$?
     fi
 
     # ═══════════════════════════════════════════════════════
-    # Phase 5: 强制安装最基础包，修复 bzip2/dpkg-dev 依赖链断裂
-    #   （截图里报错：dpkg-dev : Depends: bzip2 but it is not installable）
+    # Phase 5: 最激进的 full-upgrade（解决 gcc-14→gcc-13 跨版本降级冲突）
     # ═══════════════════════════════════════════════════════
-    log_info "[Phase 5/7] 强制安装基础依赖包（修复 bzip2/dpkg-dev 链断裂）"
+    log_info "[Phase 5/8] 执行 full-upgrade（解决 oracular→noble 跨版本 gcc/cpp 降级冲突）"
     if [ "${rc}" -eq 0 ]; then
-        # 用 dist-upgrade 让 packages 正确按新版源升级/降级（解决 "not installable"）
+        # 先单独安装 bzip2，即使依赖不满足也强制装（因为 dpkg-dev 依赖它）
+        ( sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends --fix-missing --allow-downgrades --allow-remove-essential --allow-change-held-packages -o Dpkg::Options::="--force-depends" bzip2 gzip tar xz-utils 2>&1 | tee -a "${LOG_FILE}" ) || true
+        # full-upgrade 比 dist-upgrade 更激进，能正确处理 gcc-14→gcc-13 的版本冲突
+        ( sudo DEBIAN_FRONTEND=noninteractive apt-get -y --allow-downgrades --allow-remove-essential --allow-change-held-packages full-upgrade 2>&1 | tee -a "${LOG_FILE}" ) || true
+        # 再来一次 dist-upgrade 收尾
         ( sudo DEBIAN_FRONTEND=noninteractive apt-get -y --allow-downgrades --allow-remove-essential --allow-change-held-packages dist-upgrade 2>&1 | tee -a "${LOG_FILE}" ) || true
-        # 基础包逐个装，只要有一个能装上就继续
-        local base_pkgs=(bzip2 gzip tar xz-utils dpkg dpkg-dev libc-bin libc6 libstdc++6 coreutils build-essential dkms linux-headers-$(uname -r))
-        local p
-        for p in "${base_pkgs[@]}"; do
-            ( sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends --fix-missing --allow-downgrades "${p}" 2>&1 | tee -a "${LOG_FILE}" ) || true
-        done
-        # 再来一次 -f install 收尾
-        ( sudo DEBIAN_FRONTEND=noninteractive apt-get install -f -y --fix-broken 2>&1 | tee -a "${LOG_FILE}" ) || true
     fi
 
     # ═══════════════════════════════════════════════════════
-    # Phase 6: 最终 update 验证 + build-essential 安装
+    # Phase 6: 强制安装最基础包，修复 bzip2/dpkg-dev 链断裂
     # ═══════════════════════════════════════════════════════
-    log_info "[Phase 6/7] 最终 apt update 验证..."
+    log_info "[Phase 6/8] 强制安装基础依赖包（修复 bzip2/dpkg-dev 链断裂）"
+    if [ "${rc}" -eq 0 ]; then
+        # 基础包逐个装，只要有一个能装上就继续（允许依赖降级）
+        local base_pkgs=(bzip2 gzip tar xz-utils dpkg dpkg-dev libc-bin libc6 libstdc++6 coreutils build-essential dkms "linux-headers-$(uname -r)")
+        local p
+        for p in "${base_pkgs[@]}"; do
+            ( sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends --fix-missing --allow-downgrades --allow-remove-essential --allow-change-held-packages -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" "${p}" 2>&1 | tee -a "${LOG_FILE}" ) || true
+        done
+        # -f install 收尾
+        ( sudo DEBIAN_FRONTEND=noninteractive apt-get install -f -y --fix-broken --fix-missing 2>&1 | tee -a "${LOG_FILE}" ) || true
+    fi
+
+    # ═══════════════════════════════════════════════════════
+    # Phase 7: 最终 update 验证
+    # ═══════════════════════════════════════════════════════
+    log_info "[Phase 7/8] 最终 apt update 验证..."
     sudo DEBIAN_FRONTEND=noninteractive apt-get update --fix-missing 2>&1 | tee -a "${LOG_FILE}" || rc=$?
     if [ "${rc}" -eq 0 ]; then
-        log_ok "[Phase 7/7] ✅ APT 源自动修复完成（noble 24.04 LTS 源已生效）"
+        log_ok "[Phase 8/8] ✅ APT 源自动修复完成（noble 24.04 LTS 源已生效）"
         # build-essential / linux-headers / dkms 是驱动编译必须的
-        ( sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential dkms "linux-headers-$(uname -r)" 2>&1 | tee -a "${LOG_FILE}" ) || true
+        ( sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends --allow-downgrades build-essential dkms "linux-headers-$(uname -r)" 2>&1 | tee -a "${LOG_FILE}" ) || true
         return 0
     fi
-    log_warn "[Phase 7/7] ⚠️  APT 自动修复仍未100%恢复，但会进入【驱动+CUDA runfile直装】路线（完全绕开 apt）"
+    log_warn "[Phase 8/8] ⚠️  APT 自动修复仍未100%恢复，但会进入【驱动+CUDA runfile直装】路线（完全绕开 apt）"
     return 1
 }
 
@@ -835,57 +865,66 @@ check_nvidia_driver() {
     fi
     log_warn "未检测到 nvidia-smi..."
 
-    if [ "${SKIP_SYSTEM_APT}" = "true" ]; then
-        log_warn "--skip-system-apt 生效：跳过 apt 驱动自动安装"
-        log_error "请手动安装 NVIDIA 驱动，任选其一："
-        echo "  方案A（.run直装，推荐源坏时用）:"
-        echo "    去 https://www.nvidia.com/Download/index.aspx 下载对应型号 .run"
-        echo "    sudo systemctl stop gdm3 2>/dev/null; sudo sh NVIDIA-Linux-*.run --dkms; sudo reboot"
-        echo "  方案B（修好apt后执行）:"
-        echo "    sudo ubuntu-drivers autoinstall && sudo reboot"
+    # 网络检测 + 缓存
+    if [ -z "${NET_REACHABLE_CACHED}" ]; then
+        if check_net_reachable; then
+            NET_REACHABLE_CACHED="yes"
+        else
+            NET_REACHABLE_CACHED="no"
+        fi
+    fi
+
+    local apt_tried=false
+    local apt_ok=false
+
+    if [ "${SKIP_SYSTEM_APT}" != "true" ] && [ "${NET_REACHABLE_CACHED}" = "yes" ]; then
+        log_info "开始尝试 APT 方式安装 NVIDIA 驱动..."
+        apt_tried=true
+        run_apt_safe update || true
+        run_apt_safe install -y --no-install-recommends ubuntu-drivers-common software-properties-common dkms build-essential || true
+
+        (
+            sudo add-apt-repository -y ppa:graphics-drivers/ppa 2>&1 | tee -a "${LOG_FILE}"
+        ) || log_warn "添加 graphics-drivers PPA 失败，尝试使用默认仓库"
+
+        run_apt_safe update || true
+
+        local RECOMMENDED=""
+        RECOMMENDED="$(ubuntu-drivers devices 2>/dev/null | grep -i recommended | awk '{print $3}' | head -n1 || true)"
+        if [ -z "${RECOMMENDED}" ]; then
+            RECOMMENDED="nvidia-driver-560-server"
+            log_info "ubuntu-drivers 未返回推荐驱动，使用默认: ${RECOMMENDED}"
+        else
+            log_info "ubuntu-drivers 推荐驱动: ${RECOMMENDED}"
+        fi
+
+        run_apt_safe install -y "${RECOMMENDED}" dkms || true
+
+        if command -v nvidia-smi >/dev/null 2>&1; then
+            apt_ok=true
+            log_ok "APT 驱动安装成功！当前版本: $(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1)"
+            log_warn "⚠️  强烈建议执行 sudo reboot 重启后再跑测试（dkms模块需新内核加载）"
+            return 0
+        fi
+    fi
+
+    # ═══════════════════════════════════════════════════════
+    # ★★ APT 失败或跳过 → 自动 fallback 到 .run 直装 ★★
+    # ═══════════════════════════════════════════════════════
+    if [ "${apt_ok}" != "true" ]; then
+        if [ "${apt_tried}" = "true" ]; then
+            log_warn "APT 驱动安装后仍无 nvidia-smi，自动切换到 .run 直装路线（绕开 apt，稳定性最高）"
+        elif [ "${SKIP_SYSTEM_APT}" = "true" ]; then
+            log_info "--skip-system-apt 生效，直接走 .run 直装路线"
+        fi
+        # 调用 auto_install_driver_cuda_runfile() 一次性装好驱动+CUDA
+        if auto_install_driver_cuda_runfile; then
+            return 0
+        fi
+        log_error "驱动安装（APT + .run 双路线）均失败"
         return 1
     fi
-
-    log_info "开始自动安装 NVIDIA 驱动..."
-    log_info "（若自动失败，手动执行: sudo ubuntu-drivers autoinstall && sudo reboot）"
-
-    if [ "${NET_REACHABLE_CACHED}" != "yes" ]; then
-        log_warn "当前网络不可达，跳过驱动apt安装，请先联网或手动安装"
-        return 1
-    fi
-
-    run_apt_safe update || true
-    run_apt_safe install -y --no-install-recommends ubuntu-drivers-common software-properties-common dkms build-essential || true
-
-    (
-        sudo add-apt-repository -y ppa:graphics-drivers/ppa 2>&1 | tee -a "${LOG_FILE}"
-    ) || log_warn "添加 graphics-drivers PPA 失败，尝试使用默认仓库"
-
-    run_apt_safe update || true
-
-    local RECOMMENDED=""
-    RECOMMENDED="$(ubuntu-drivers devices 2>/dev/null | grep -i recommended | awk '{print $3}' | head -n1 || true)"
-    if [ -z "${RECOMMENDED}" ]; then
-        RECOMMENDED="nvidia-driver-560-server"
-        log_info "ubuntu-drivers 未返回推荐驱动，使用默认: ${RECOMMENDED}"
-    else
-        log_info "ubuntu-drivers 推荐驱动: ${RECOMMENDED}"
-    fi
-
-    run_apt_safe install -y "${RECOMMENDED}" dkms || true
-
-    if command -v nvidia-smi >/dev/null 2>&1; then
-        log_ok "驱动安装成功！当前版本: $(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1)"
-        log_warn "⚠️  强烈建议执行 sudo reboot 重启后再跑测试（dkms模块需新内核加载，否则后续CUDA/nvidia-smi可能段错误）"
-        return 0
-    else
-        log_error "驱动apt安装后仍无 nvidia-smi，请手动执行："
-        echo "  方案A: sudo ubuntu-drivers autoinstall && sudo reboot"
-        echo "  方案B: sudo apt-get install -y nvidia-driver-560-server dkms && sudo reboot"
-        echo "  方案C: 从 https://www.nvidia.com/Download 下载 .run 文件:"
-        echo "         sudo systemctl stop gdm3; sudo sh NVIDIA-Linux-*.run --dkms"
-        return 1
-    fi
+    return 0
 }
 
 # ==================== 顺序16: install_cuda_toolkit() ====================
@@ -915,74 +954,52 @@ install_cuda_toolkit() {
 
     local CUDA_RUNFILE="cuda_${CUDA_VERSION}_${CUDA_RUNFILE_VERSION}_linux.run"
     local CUDA_URL="https://developer.download.nvidia.com/compute/cuda/${CUDA_VERSION}/local_installers/${CUDA_RUNFILE}"
-    local CUDA_KEYRING_URL="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb"
-    local INSTALLED_OK=false
+
+    # ═══════════════════════════════════════════════════════
+    # ★ 统一只用 CUDA runfile 直装（彻底删除 apt fallback）
+    #   - 避免 cuda-keyring 添加 NVIDIA apt 源后又触发 devel→nobleoper 域名 bug
+    #   - 避免 ubuntuoracular / 版本号路径不匹配
+    #   - runfile 方式独立于系统 apt 源，稳定性最高
+    # ═══════════════════════════════════════════════════════
 
     if [ "${NET_REACHABLE_CACHED}" != "yes" ]; then
-        # 尝试探测一次网络
         if check_net_reachable; then
             NET_REACHABLE_CACHED="yes"
         fi
     fi
     if [ "${NET_REACHABLE_CACHED}" != "yes" ]; then
         log_warn "网络不可达，跳过CUDA自动安装（可手动下载runfile后执行）"
-        log_info "手动命令: wget ${CUDA_URL} && sudo sh ${CUDA_RUNFILE} --silent --toolkit"
+        log_info "手动命令: wget ${CUDA_URL} -O /tmp/${CUDA_RUNFILE} && sudo sh /tmp/${CUDA_RUNFILE} --silent --toolkit --samples --samplespath=/usr/local/cuda/samples --override"
         mkdir -p "${OUTPUT_DIR}/cuda_samples_bin"
         echo "${OUTPUT_DIR}/cuda_samples_bin" > "${CUDA_BIN_DIR_FILE}"
         return 1
     fi
 
-    # ── 方式1 优先：CUDA runfile 直装（不依赖系统 apt 源，404场景也能走通）──
-    log_info "方式1（优先）: 下载 CUDA runfile ${CUDA_RUNFILE} 直装"
-    if command -v wget >/dev/null 2>&1; then
-        ( cd /tmp && wget -q --show-progress "${CUDA_URL}" -O "/tmp/${CUDA_RUNFILE}" ) 2>&1 | tee -a "${LOG_FILE}" || true
-    elif command -v curl >/dev/null 2>&1; then
-        ( cd /tmp && curl -fsSL -o "/tmp/${CUDA_RUNFILE}" "${CUDA_URL}" ) 2>&1 | tee -a "${LOG_FILE}" || true
-    else
-        log_error "wget/curl 都不存在，runfile下载失败"
-    fi
-
-    if [ -f "/tmp/${CUDA_RUNFILE}" ] && [ -s "/tmp/${CUDA_RUNFILE}" ]; then
-        log_info "runfile 下载完成，开始静默安装 toolkit+samples"
-        chmod +x "/tmp/${CUDA_RUNFILE}"
-        ( sudo sh "/tmp/${CUDA_RUNFILE}" --silent --toolkit --samples --samplespath=/usr/local/cuda/samples --override ) 2>&1 | tee -a "${LOG_FILE}" || true
-        if [ -f /usr/local/cuda/bin/nvcc ]; then
-            INSTALLED_OK=true
-            log_ok "CUDA runfile 安装成功"
-        fi
-    fi
-
-    # ── 方式2 fallback：cuda-keyring.deb + apt（只有 SKIP_SYSTEM_APT=false 才尝试）──
-    if [ "${INSTALLED_OK}" = "false" ] && [ "${SKIP_SYSTEM_APT}" = "false" ]; then
-        # 根据探测到的 CUDA_VERSION 动态构造 apt 包名
-        # CUDA 12.6.0 → cuda-toolkit-12-6 （MAJOR.MINOR 优先，存在概率最高）
-        #               → cuda-toolkit-12-6-0 （完整版本 fallback）
-        local CUDA_MM="${CUDA_VERSION%.*}"                        # 12.6.0 → 12.6
-        local CUDA_TOOLKIT_PKG_MM="cuda-toolkit-${CUDA_MM//./-}"   # 12.6 → cuda-toolkit-12-6
-        local CUDA_TOOLKIT_PKG_FULL="cuda-toolkit-${CUDA_VERSION//./-}" # 12.6.0 → cuda-toolkit-12-6-0
-        log_info "方式2（fallback）: cuda-keyring.deb + apt 安装 ${CUDA_TOOLKIT_PKG_MM} (或 ${CUDA_TOOLKIT_PKG_FULL})"
+    # 下载 + 安装 CUDA runfile
+    log_info "📦 下载并安装 CUDA runfile ${CUDA_RUNFILE}（约 4GB，纯 .run 直装，不依赖 apt 源）"
+    log_info "   URL: ${CUDA_URL}"
+    if [ ! -f "/tmp/${CUDA_RUNFILE}" ] || [ ! -s "/tmp/${CUDA_RUNFILE}" ]; then
+        rm -f "/tmp/${CUDA_RUNFILE}" 2>/dev/null || true
+        local dl_ok=false
         if command -v wget >/dev/null 2>&1; then
-            wget -q "${CUDA_KEYRING_URL}" -O /tmp/cuda-keyring.deb 2>&1 | tee -a "${LOG_FILE}" || true
-        elif command -v curl >/dev/null 2>&1; then
-            curl -fsSL -o /tmp/cuda-keyring.deb "${CUDA_KEYRING_URL}" 2>&1 | tee -a "${LOG_FILE}" || true
+            ( cd /tmp && wget --tries=3 --timeout=30 --continue --show-progress "${CUDA_URL}" -O "/tmp/${CUDA_RUNFILE}" ) 2>&1 | tee -a "${LOG_FILE}" && dl_ok=true || true
         fi
-        if [ -f /tmp/cuda-keyring.deb ] && [ -s /tmp/cuda-keyring.deb ]; then
-            sudo dpkg -i /tmp/cuda-keyring.deb 2>&1 | tee -a "${LOG_FILE}" || true
-            run_apt_safe update || true
-            # 先试 MAJOR.MINOR 包（cuda-toolkit-12-6），失败再试完整版本（cuda-toolkit-12-6-0）
-            local apt_cuda_rc=0
-            run_apt_safe install -y "${CUDA_TOOLKIT_PKG_MM}" || apt_cuda_rc=$?
-            if [ "${apt_cuda_rc}" -ne 0 ]; then
-                run_apt_safe install -y "${CUDA_TOOLKIT_PKG_FULL}" || true
-            fi
-            if [ -f /usr/local/cuda/bin/nvcc ]; then
-                INSTALLED_OK=true
-                log_ok "CUDA apt 安装成功"
-            fi
+        if [ "${dl_ok}" = "false" ] && command -v curl >/dev/null 2>&1; then
+            ( cd /tmp && curl -L --retry 3 -C - -o "/tmp/${CUDA_RUNFILE}" "${CUDA_URL}" ) 2>&1 | tee -a "${LOG_FILE}" && dl_ok=true || true
         fi
-    elif [ "${INSTALLED_OK}" = "false" ] && [ "${SKIP_SYSTEM_APT}" = "true" ]; then
-        log_warn "--skip-system-apt 生效：跳过 apt 方式安装 CUDA"
+        if [ ! -f "/tmp/${CUDA_RUNFILE}" ] || [ ! -s "/tmp/${CUDA_RUNFILE}" ]; then
+            log_error "❌ CUDA runfile 下载失败"
+            mkdir -p "${OUTPUT_DIR}/cuda_samples_bin"
+            echo "${OUTPUT_DIR}/cuda_samples_bin" > "${CUDA_BIN_DIR_FILE}"
+            return 1
+        fi
+    else
+        log_info "📦 复用已有 runfile: /tmp/${CUDA_RUNFILE}"
     fi
+    chmod +x "/tmp/${CUDA_RUNFILE}" 2>/dev/null || true
+
+    log_info "安装 CUDA toolkit + samples 中（大概 5~10 分钟）..."
+    ( sudo sh "/tmp/${CUDA_RUNFILE}" --silent --toolkit --samples --samplespath=/usr/local/cuda/samples --override --no-opengl-files ) 2>&1 | tee -a "${LOG_FILE}" || true
 
     export PATH="/usr/local/cuda/bin:${PATH}"
     export LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH}"
@@ -994,24 +1011,15 @@ install_cuda_toolkit() {
     if command -v nvcc >/dev/null 2>&1; then
         log_ok "nvcc 已就绪: $(nvcc --version 2>/dev/null | grep -E 'release [0-9]' | head -n1)"
         compile_cuda_samples
-    else
-        # 动态包名用于提示信息
-        local CUDA_MM2="${CUDA_VERSION%.*}"
-        local CUDA_TOOLKIT_PKG_HINT="cuda-toolkit-${CUDA_MM2//./-}"
-        log_error "CUDA Toolkit 自动安装失败，请手动执行："
-        echo "  # 方式1 runfile（推荐 ✨ apt源404时也能用）"
-        echo "  wget ${CUDA_URL}"
-        echo "  sudo sh ${CUDA_RUNFILE} --silent --toolkit --samples --samplespath=/usr/local/cuda/samples --override"
-        echo ""
-        echo "  # 方式2 apt（apt源可用时用）"
-        echo "  wget ${CUDA_KEYRING_URL}"
-        echo "  sudo dpkg -i cuda-keyring_1.1-1_all.deb && sudo apt-get update"
-        echo "  sudo apt-get install -y ${CUDA_TOOLKIT_PKG_HINT}"
-        mkdir -p "${OUTPUT_DIR}/cuda_samples_bin"
-        echo "${OUTPUT_DIR}/cuda_samples_bin" > "${CUDA_BIN_DIR_FILE}"
-        return 1
+        return 0
     fi
-    return 0
+    log_error "CUDA Toolkit (.run) 安装失败，nvcc 仍不可用。请手动执行："
+    echo "  wget ${CUDA_URL} -O /tmp/${CUDA_RUNFILE}"
+    echo "  sudo chmod +x /tmp/${CUDA_RUNFILE}"
+    echo "  sudo sh /tmp/${CUDA_RUNFILE} --silent --toolkit --samples --samplespath=/usr/local/cuda/samples --override --no-opengl-files"
+    mkdir -p "${OUTPUT_DIR}/cuda_samples_bin"
+    echo "${OUTPUT_DIR}/cuda_samples_bin" > "${CUDA_BIN_DIR_FILE}"
+    return 1
 }
 
 # ==================== 顺序17: compile_cuda_samples() ====================
