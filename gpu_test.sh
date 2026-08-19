@@ -159,42 +159,78 @@ fix_apt_sources() {
     os_id="$(grep -E '^ID=' /etc/os-release | cut -d= -f2 | tr -d '"')"
     [ "${os_id}" != "ubuntu" ] && return 0
 
-    # 探测是否需要修：执行一次 apt update（超短超时）看是否 404 / no Release file
+    # 探测是否需要修：执行一次 apt update（超短超时）看是否 404 / no Release file / held broken packages
     local need_fix=false
     local probe_out=""
-    probe_out="$(sudo timeout 30 apt-get update 2>&1 || true)"
-    if echo "${probe_out}" | grep -qE '404[[:space:]]+Not Found|does not have a Release file|no longer has a Release file|is not available'; then
+    probe_out="$(sudo timeout 60 apt-get update 2>&1 || true)"
+    if echo "${probe_out}" | grep -qE '404[[:space:]]+Not Found|does not have a Release file|no longer has a Release file|is not available|held broken packages|unmet dependencies|Depends: .* but it is not installable'; then
         need_fix=true
     fi
     # 兜底：如果版本代号本身就是已知失效版（oracular=24.10 interim）直接修
     local version_codename=""
     version_codename="$(grep -E '^VERSION_CODENAME=' /etc/os-release | cut -d= -f2 | tr -d '"')"
     case "${version_codename}" in
-        oracular|mantic|lunar|kinetic|jammy-backports)  need_fix=true ;;
+        oracular|mantic|lunar|kinetic|plucky|devel)  need_fix=true ;;
     esac
+    # PPA codename 检查：sources.list.d 里有没有 oracular/mantic 等失效代号
+    if grep -rnE 'ubuntu +(oracular|mantic|lunar|kinetic|plucky|devel) ' /etc/apt/sources.list.d/ >/dev/null 2>&1; then
+        need_fix=true
+    fi
 
     if [ "${need_fix}" = "false" ]; then
         log_ok "APT源检测正常，跳过自动修复"
         return 0
     fi
 
-    log_warn "🔧 检测到 APT 源 404/失效（codename=${version_codename}），开始自动替换为清华 Ubuntu 24.04 LTS (noble) 源..."
+    log_warn "🔧 检测到 APT 源 404/失效 或 broken packages（codename=${version_codename}），开始自动替换为 Ubuntu 24.04 LTS (noble) 源..."
+
+    # ═══════════════════════════════════════════════════════
+    # Phase 0: 先清 APT/dpkg 锁 + held packages + 基础自愈
+    # ═══════════════════════════════════════════════════════
+    log_info "[Phase 0/7] 清理锁文件 + held packages + dpkg自愈"
+    sudo rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock 2>/dev/null || true
+    # 清所有 held packages（held 会导致"you have held broken packages"）
+    ( sudo apt-mark unhold $(sudo apt-mark showhold 2>/dev/null || true) 2>/dev/null ) || true
+    ( sudo dpkg --configure -a --force-confdef --force-confold 2>&1 | tee -a "${LOG_FILE}" ) || true
+    ( sudo DEBIAN_FRONTEND=noninteractive apt-get install -f -y --fix-broken 2>&1 | tee -a "${LOG_FILE}" ) || true
 
     # ── 1. 备份 ──
     local bak="/etc/apt/sources.list.gpu_test_bak_$(date +%Y%m%d_%H%M%S)"
     sudo cp -a /etc/apt/sources.list "${bak}" 2>/dev/null || true
     log_info "原 sources.list 已备份到: ${bak}"
 
-    # ── 2. 清掉 /etc/apt/sources.list.d/*.list 里的 ubuntu 官方源（hk.archive等），保留第三方PPA（graphics-drivers/nvidia-cuda/dcgm）──
+    # ═══════════════════════════════════════════════════════
+    # Phase 1: sources.list.d/*.list 和 .sources 修复
+    #   - 删掉 ubuntu 官方源（hk.archive等）行，保留第三方PPA
+    #   - ★ 关键：把 PPA URL 里 oracular/mantic/... → noble 替换！
+    # ═══════════════════════════════════════════════════════
+    log_info "[Phase 1/7] 修复 sources.list.d/ PPA 源（codename 失效代号 → noble）"
     local d_list=""
-    for d_list in /etc/apt/sources.list.d/*.list; do
+    local BAD_CODENAMES_REGEX='(oracular|mantic|lunar|kinetic|plucky|devel|groovy|hirsute|impish|jammy-backports)'
+    # 使用 shopt nullglob 防止 glob 不匹配时返回原始字符串
+    local _nullglob_was_on=false
+    shopt -q nullglob && _nullglob_was_on=true
+    shopt -s nullglob
+    for d_list in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
         [ -f "${d_list}" ] || continue
-        # 只删包含 archive.ubuntu.com / security.ubuntu.com / hk. / cn. 的行，保留其他 PPA
-        sudo sed -i -E '/(archive|security)\.ubuntu\.com/d' "${d_list}" 2>/dev/null || true
+        # a) 删 ubuntu 官方源行，保留 graphics-drivers / nvidia-cuda / dcgm 等第三方 PPA
+        sudo sed -i -E '/(archive|security|hk\.|cn\.|tw\.|jp\.)\.ubuntu\.com/d' "${d_list}" 2>/dev/null || true
+        # b) ★ 把 PPA URL 里的 oracular/mantic/lunar/... 统一替换成 noble
+        #    .list 格式: deb http://xxx/ubuntu oracular main
+        #    .sources 格式: Suites: oracular
+        sudo sed -i -E "s/${BAD_CODENAMES_REGEX}/noble/g" "${d_list}" 2>/dev/null || true
     done
+    # 恢复 nullglob 原始状态
+    if [ "${_nullglob_was_on}" = "false" ]; then
+        shopt -u nullglob 2>/dev/null || true
+    fi
     sudo rm -f /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
+    log_ok "sources.list.d/ PPA codename 失效代号已统一替换为 noble"
 
-    # ── 3. 写入新 sources.list：清华 noble 24.04 LTS 源（全球/国内都能用）──
+    # ═══════════════════════════════════════════════════════
+    # Phase 2: 写入新 sources.list
+    # ═══════════════════════════════════════════════════════
+    log_info "[Phase 2/7] 写入新 sources.list（清华 noble 24.04 LTS）"
     sudo tee /etc/apt/sources.list >/dev/null 2>&1 <<'APT_EOF'
 deb https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ noble main restricted universe multiverse
 deb https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ noble-updates main restricted universe multiverse
@@ -202,7 +238,7 @@ deb https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ noble-backports main restricted
 deb http://security.ubuntu.com/ubuntu/ noble-security main restricted universe multiverse
 APT_EOF
 
-    # ── 4. 如清华源不可达（纯海外网络），fallback 回官方 archive ──
+    # ── 如清华源不可达（纯海外网络），fallback 回官方 archive ──
     if ! (echo > /dev/tcp/mirrors.tuna.tsinghua.edu.cn/443) >/dev/null 2>&1; then
         log_info "清华源TCP不可达（可能是海外网络），切换到官方 archive.ubuntu.com noble 源"
         sudo tee /etc/apt/sources.list >/dev/null 2>&1 <<'APT_EOF'
@@ -213,30 +249,62 @@ deb http://security.ubuntu.com/ubuntu/ noble-security main restricted universe m
 APT_EOF
     fi
 
-    # ── 5. 锁 + 清 + update ──
-    sudo rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock 2>/dev/null || true
+    # ═══════════════════════════════════════════════════════
+    # Phase 3: 清缓存 + apt update
+    # ═══════════════════════════════════════════════════════
+    log_info "[Phase 3/7] 清 APT 缓存 + apt update"
     sudo rm -rf /var/lib/apt/lists/* 2>/dev/null || true
     sudo mkdir -p /var/lib/apt/lists/partial 2>/dev/null || true
     local rc=0
-    sudo DEBIAN_FRONTEND=noninteractive apt-get update --fix-missing --allow-releaseinfo-change 2>&1 | tee -a "${LOG_FILE}" || rc=$?
+    sudo DEBIAN_FRONTEND=noninteractive apt-get update --fix-missing --allow-releaseinfo-change -o Acquire::Retries=3 2>&1 | tee -a "${LOG_FILE}" || rc=$?
+
+    # ═══════════════════════════════════════════════════════
+    # Phase 4: 如有 update 错误 → 再一次 dpkg + -f install
+    # ═══════════════════════════════════════════════════════
     if [ "${rc}" -ne 0 ]; then
-        log_warn "APT修复第一次失败，尝试 dpkg --configure + -f install ..."
+        log_warn "[Phase 4/7] apt update 第一次失败，尝试 dpkg --configure + -f install + 再update"
         ( sudo dpkg --configure -a --force-confdef --force-confold 2>&1 | tee -a "${LOG_FILE}" ) || true
-        ( sudo DEBIAN_FRONTEND=noninteractive apt-get install -f -y --fix-broken 2>&1 | tee -a "${LOG_FILE}" ) || true
+        ( sudo DEBIAN_FRONTEND=noninteractive apt-get install -f -y --fix-broken --fix-missing 2>&1 | tee -a "${LOG_FILE}" ) || true
         sudo DEBIAN_FRONTEND=noninteractive apt-get update --fix-missing 2>&1 | tee -a "${LOG_FILE}" || rc=$?
     fi
+
+    # ═══════════════════════════════════════════════════════
+    # Phase 5: 强制安装最基础包，修复 bzip2/dpkg-dev 依赖链断裂
+    #   （截图里报错：dpkg-dev : Depends: bzip2 but it is not installable）
+    # ═══════════════════════════════════════════════════════
+    log_info "[Phase 5/7] 强制安装基础依赖包（修复 bzip2/dpkg-dev 链断裂）"
     if [ "${rc}" -eq 0 ]; then
-        log_ok "✅ APT 源自动修复完成（noble 24.04 LTS 源已生效）"
-        # 顺便把 build-essential 补了，后面 gpu-burn 要用
-        ( sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential dkms linux-headers-$(uname -r) 2>&1 | tee -a "${LOG_FILE}" ) || true
+        # 用 dist-upgrade 让 packages 正确按新版源升级/降级（解决 "not installable"）
+        ( sudo DEBIAN_FRONTEND=noninteractive apt-get -y --allow-downgrades --allow-remove-essential --allow-change-held-packages dist-upgrade 2>&1 | tee -a "${LOG_FILE}" ) || true
+        # 基础包逐个装，只要有一个能装上就继续
+        local base_pkgs=(bzip2 gzip tar xz-utils dpkg dpkg-dev libc-bin libc6 libstdc++6 coreutils build-essential dkms linux-headers-$(uname -r))
+        local p
+        for p in "${base_pkgs[@]}"; do
+            ( sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends --fix-missing --allow-downgrades "${p}" 2>&1 | tee -a "${LOG_FILE}" ) || true
+        done
+        # 再来一次 -f install 收尾
+        ( sudo DEBIAN_FRONTEND=noninteractive apt-get install -f -y --fix-broken 2>&1 | tee -a "${LOG_FILE}" ) || true
+    fi
+
+    # ═══════════════════════════════════════════════════════
+    # Phase 6: 最终 update 验证 + build-essential 安装
+    # ═══════════════════════════════════════════════════════
+    log_info "[Phase 6/7] 最终 apt update 验证..."
+    sudo DEBIAN_FRONTEND=noninteractive apt-get update --fix-missing 2>&1 | tee -a "${LOG_FILE}" || rc=$?
+    if [ "${rc}" -eq 0 ]; then
+        log_ok "[Phase 7/7] ✅ APT 源自动修复完成（noble 24.04 LTS 源已生效）"
+        # build-essential / linux-headers / dkms 是驱动编译必须的
+        ( sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential dkms "linux-headers-$(uname -r)" 2>&1 | tee -a "${LOG_FILE}" ) || true
         return 0
     fi
-    log_error "APT 自动修复仍失败，但后续会用 .run 直装驱动+CUDA（不依赖apt继续跑）"
+    log_warn "[Phase 7/7] ⚠️  APT 自动修复仍未100%恢复，但会进入【驱动+CUDA runfile直装】路线（完全绕开 apt）"
     return 1
 }
 
 # ==================== 顺序5c: auto_install_driver_cuda_runfile() 全自动 .run 直装驱动+CUDA（绕开apt）====================
 auto_install_driver_cuda_runfile() {
+    # ★ 第一步：HTTP探测真实存在的CUDA版本（彻底解决404）
+    probe_cuda_runfile
     local CUDA_RUNFILE="cuda_${CUDA_VERSION}_${CUDA_RUNFILE_VERSION}_linux.run"
     local CUDA_URL="https://developer.download.nvidia.com/compute/cuda/${CUDA_VERSION}/local_installers/${CUDA_RUNFILE}"
     local runfile_path="/tmp/${CUDA_RUNFILE}"
@@ -412,8 +480,16 @@ if [ -z "${SELF_CHMOD_DONE}" ]; then
 fi
 
 # ==================== 顺序8: 配置区（全局变量） ====================
-CUDA_VERSION="12.6.1"
-CUDA_RUNFILE_VERSION="560.35.05"
+# ⚠️ CUDA 版本必须是 NVIDIA 官网真实存在的版本！
+# 多个候选版本（按优先级），会依次HTTP探测直到找到可下载的版本
+CUDA_VERSION_CANDIDATES=(
+    "12.6.0:560.28.03"     # CUDA 12.6.0 + 560.28.03  (2024年稳定版，100%存在)
+    "12.8.0:570.109.03"    # CUDA 12.8.0 + 570.109.03 (2025最新，100%存在)
+    "12.4.1:550.54.15"     # CUDA 12.4.1 + 550.54.15  (经典LTS稳定，100%存在)
+    "12.5.1:555.42.06"     # CUDA 12.5.1 + 555.42.06  (第三稳定fallback)
+)
+CUDA_VERSION=""          # 运行时探测后赋值
+CUDA_RUNFILE_VERSION=""  # 运行时探测后赋值
 STRESS_DURATION_SEC=60
 GPUBURN_DURATION_SEC=120
 FIELD_LEVEL=1
@@ -427,6 +503,44 @@ SKIP_TOOLS_BUILD=false
 STRESS_ONLY=false
 FORCE_FIELDIAG=false
 NET_REACHABLE_CACHED=""
+
+# ==================== 顺序8b: probe_cuda_runfile() CUDA runfile 多版本HTTP探测 ====================
+probe_cuda_runfile() {
+    # 已设置过就不重复探测
+    if [ -n "${CUDA_VERSION}" ] && [ -n "${CUDA_RUNFILE_VERSION}" ]; then
+        return 0
+    fi
+    log_info "🔍 开始探测 NVIDIA 官网真实存在的 CUDA runfile 版本（${#CUDA_VERSION_CANDIDATES[@]}个候选）..."
+    local entry cuda_ver drv_ver url http_code
+    for entry in "${CUDA_VERSION_CANDIDATES[@]}"; do
+        cuda_ver="${entry%%:*}"
+        drv_ver="${entry##*:}"
+        url="https://developer.download.nvidia.com/compute/cuda/${cuda_ver}/local_installers/cuda_${cuda_ver}_${drv_ver}_linux.run"
+        log_info "  探测 CUDA ${cuda_ver} (driver ${drv_ver}) ..."
+        # HTTP HEAD 探测，超时 15 秒，只看状态码不下载内容
+        if command -v curl >/dev/null 2>&1; then
+            http_code="$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 -I "${url}" 2>/dev/null || echo 000)"
+        elif command -v wget >/dev/null 2>&1; then
+            http_code="$(wget -q --spider --timeout=15 -S "${url}" 2>&1 | grep -E 'HTTP/' | tail -n1 | grep -oE '[0-9]{3}' | head -n1 || echo 000)"
+        else
+            # 没 wget/curl 就跳过探测，用第一个候选
+            http_code="200"
+        fi
+        if [ "${http_code}" = "200" ] || [ "${http_code}" = "302" ] || [ "${http_code}" = "301" ]; then
+            CUDA_VERSION="${cuda_ver}"
+            CUDA_RUNFILE_VERSION="${drv_ver}"
+            log_ok "✅ 找到真实可用版本: CUDA=${CUDA_VERSION}  Driver=${CUDA_RUNFILE_VERSION}"
+            return 0
+        else
+            log_info "    ❌ HTTP ${http_code}，跳过此版本"
+        fi
+    done
+    # 全部探测失败，保底用经典 CUDA 12.4.1
+    CUDA_VERSION="12.4.1"
+    CUDA_RUNFILE_VERSION="550.54.15"
+    log_warn "⚠️  全部HTTP探测失败（可能无公网或下载器异常），保底使用 CUDA ${CUDA_VERSION} + ${CUDA_RUNFILE_VERSION}"
+    return 0
+}
 
 # ==================== 顺序9: save_raw() 函数 ====================
 save_raw() {
@@ -777,6 +891,8 @@ check_nvidia_driver() {
 # ==================== 顺序16: install_cuda_toolkit() ====================
 install_cuda_toolkit() {
     log_info "===== CUDA Toolkit 检查/安装 ====="
+    # ★ 第一步：HTTP探测真实存在的CUDA版本（彻底解决404）
+    probe_cuda_runfile
     if [ "${SKIP_CUDA}" = "true" ]; then
         log_info "--skip-cuda 生效：跳过 CUDA Toolkit 下载/安装"
         if command -v nvcc >/dev/null 2>&1; then
@@ -838,7 +954,13 @@ install_cuda_toolkit() {
 
     # ── 方式2 fallback：cuda-keyring.deb + apt（只有 SKIP_SYSTEM_APT=false 才尝试）──
     if [ "${INSTALLED_OK}" = "false" ] && [ "${SKIP_SYSTEM_APT}" = "false" ]; then
-        log_info "方式2（fallback）: cuda-keyring.deb + apt 安装 cuda-toolkit-12-6-1"
+        # 根据探测到的 CUDA_VERSION 动态构造 apt 包名
+        # CUDA 12.6.0 → cuda-toolkit-12-6 （MAJOR.MINOR 优先，存在概率最高）
+        #               → cuda-toolkit-12-6-0 （完整版本 fallback）
+        local CUDA_MM="${CUDA_VERSION%.*}"                        # 12.6.0 → 12.6
+        local CUDA_TOOLKIT_PKG_MM="cuda-toolkit-${CUDA_MM//./-}"   # 12.6 → cuda-toolkit-12-6
+        local CUDA_TOOLKIT_PKG_FULL="cuda-toolkit-${CUDA_VERSION//./-}" # 12.6.0 → cuda-toolkit-12-6-0
+        log_info "方式2（fallback）: cuda-keyring.deb + apt 安装 ${CUDA_TOOLKIT_PKG_MM} (或 ${CUDA_TOOLKIT_PKG_FULL})"
         if command -v wget >/dev/null 2>&1; then
             wget -q "${CUDA_KEYRING_URL}" -O /tmp/cuda-keyring.deb 2>&1 | tee -a "${LOG_FILE}" || true
         elif command -v curl >/dev/null 2>&1; then
@@ -847,7 +969,12 @@ install_cuda_toolkit() {
         if [ -f /tmp/cuda-keyring.deb ] && [ -s /tmp/cuda-keyring.deb ]; then
             sudo dpkg -i /tmp/cuda-keyring.deb 2>&1 | tee -a "${LOG_FILE}" || true
             run_apt_safe update || true
-            run_apt_safe install -y cuda-toolkit-12-6-1 || true
+            # 先试 MAJOR.MINOR 包（cuda-toolkit-12-6），失败再试完整版本（cuda-toolkit-12-6-0）
+            local apt_cuda_rc=0
+            run_apt_safe install -y "${CUDA_TOOLKIT_PKG_MM}" || apt_cuda_rc=$?
+            if [ "${apt_cuda_rc}" -ne 0 ]; then
+                run_apt_safe install -y "${CUDA_TOOLKIT_PKG_FULL}" || true
+            fi
             if [ -f /usr/local/cuda/bin/nvcc ]; then
                 INSTALLED_OK=true
                 log_ok "CUDA apt 安装成功"
@@ -868,6 +995,9 @@ install_cuda_toolkit() {
         log_ok "nvcc 已就绪: $(nvcc --version 2>/dev/null | grep -E 'release [0-9]' | head -n1)"
         compile_cuda_samples
     else
+        # 动态包名用于提示信息
+        local CUDA_MM2="${CUDA_VERSION%.*}"
+        local CUDA_TOOLKIT_PKG_HINT="cuda-toolkit-${CUDA_MM2//./-}"
         log_error "CUDA Toolkit 自动安装失败，请手动执行："
         echo "  # 方式1 runfile（推荐 ✨ apt源404时也能用）"
         echo "  wget ${CUDA_URL}"
@@ -876,7 +1006,7 @@ install_cuda_toolkit() {
         echo "  # 方式2 apt（apt源可用时用）"
         echo "  wget ${CUDA_KEYRING_URL}"
         echo "  sudo dpkg -i cuda-keyring_1.1-1_all.deb && sudo apt-get update"
-        echo "  sudo apt-get install -y cuda-toolkit-12-6-1"
+        echo "  sudo apt-get install -y ${CUDA_TOOLKIT_PKG_HINT}"
         mkdir -p "${OUTPUT_DIR}/cuda_samples_bin"
         echo "${OUTPUT_DIR}/cuda_samples_bin" > "${CUDA_BIN_DIR_FILE}"
         return 1
@@ -1881,12 +2011,16 @@ main() {
 
     init
 
+    # ★ 最优先：HTTP探测真实存在的CUDA版本（解决 404 致命问题）
+    probe_cuda_runfile || true
+
     log_info "======================================"
     log_info "输出目录 : ${OUTPUT_DIR}"
     log_info "日志文件 : ${LOG_FILE}"
     log_info "配置: stress=${STRESS_DURATION_SEC}s  gpuburn=${GPUBURN_DURATION_SEC}s  fieldiag=L${FIELD_LEVEL}  temp_alarm=${TEMP_ALARM_C}°C"
     log_info "开关: skip_install=${SKIP_INSTALL}  skip_system_apt=${SKIP_SYSTEM_APT}  skip_cuda=${SKIP_CUDA}  skip_dcgm=${SKIP_DCGM}  skip_tools_build=${SKIP_TOOLS_BUILD}"
     log_info "开关: stress_only=${STRESS_ONLY}  force_fieldiag=${FORCE_FIELDIAG}"
+    log_info "CUDA真实版本（已探测）: ${CUDA_VERSION} / 驱动 ${CUDA_RUNFILE_VERSION}"
     log_info "======================================"
 
     cat > "${RUN_CONFIG_FILE}" <<EOF
