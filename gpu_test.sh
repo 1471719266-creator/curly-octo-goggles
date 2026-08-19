@@ -856,14 +856,32 @@ check_system() {
 # ==================== 顺序15: check_nvidia_driver() ====================
 check_nvidia_driver() {
     log_info "===== NVIDIA 驱动检查 ====="
-    if command -v nvidia-smi >/dev/null 2>&1; then
+
+    # ★ 核心验证函数：必须 nvidia-smi 存在 + 能真正读到 ≥1 张 GPU（或 driver_version 非空）才算通过
+    verify_driver_loaded() {
+        if ! command -v nvidia-smi >/dev/null 2>&1; then
+            return 1
+        fi
+        local gpu_count drv_ver
+        gpu_count="$(nvidia-smi -L 2>/dev/null | wc -l || echo 0)"
+        drv_ver="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1 || echo '')"
+        if [ "${gpu_count}" -ge 1 ] || [ -n "${drv_ver}" ]; then
+            return 0
+        fi
+        # 命令存在但读不到 GPU：可能是内核模块没加载 / nouveau 抢设备 / Secure Boot 签名失败
+        return 2
+    }
+
+    if verify_driver_loaded; then
         local drv_ver
         drv_ver="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1 || echo unknown)"
-        log_ok "nvidia-smi 已就绪，驱动版本=${drv_ver}"
+        local gpu_count
+        gpu_count="$(nvidia-smi -L 2>/dev/null | wc -l || echo 0)"
+        log_ok "nvidia-smi 已就绪，驱动版本=${drv_ver}，检测到 ${gpu_count} 张 GPU"
         save_raw nvidia_smi_initial nvidia-smi
         return 0
     fi
-    log_warn "未检测到 nvidia-smi..."
+    log_warn "未检测到可用 nvidia-smi（驱动未安装或内核模块未加载）..."
 
     # 网络检测 + 缓存
     if [ -z "${NET_REACHABLE_CACHED}" ]; then
@@ -881,7 +899,7 @@ check_nvidia_driver() {
         log_info "开始尝试 APT 方式安装 NVIDIA 驱动..."
         apt_tried=true
         run_apt_safe update || true
-        run_apt_safe install -y --no-install-recommends ubuntu-drivers-common software-properties-common dkms build-essential || true
+        run_apt_safe install -y --no-install-recommends ubuntu-drivers-common software-properties-common dkms build-essential linux-headers-$(uname -r) || true
 
         (
             sudo add-apt-repository -y ppa:graphics-drivers/ppa 2>&1 | tee -a "${LOG_FILE}"
@@ -898,13 +916,21 @@ check_nvidia_driver() {
             log_info "ubuntu-drivers 推荐驱动: ${RECOMMENDED}"
         fi
 
-        run_apt_safe install -y "${RECOMMENDED}" dkms || true
+        run_apt_safe install -y "${RECOMMENDED}" dkms linux-headers-$(uname -r) || true
+        # APT 装完后：重建一次 dkms + 尝试 modprobe nvidia
+        ( sudo dkms autoinstall 2>&1 | tee -a "${LOG_FILE}" ) || true
+        ( sudo depmod -a 2>&1 | tee -a "${LOG_FILE}" ) || true
+        ( sudo modprobe nvidia 2>&1 | tee -a "${LOG_FILE}" ) || true
 
-        if command -v nvidia-smi >/dev/null 2>&1; then
+        if verify_driver_loaded; then
             apt_ok=true
             log_ok "APT 驱动安装成功！当前版本: $(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1)"
             log_warn "⚠️  强烈建议执行 sudo reboot 重启后再跑测试（dkms模块需新内核加载）"
             return 0
+        fi
+        # 命令存在但读不到 GPU → 多半是没重启
+        if command -v nvidia-smi >/dev/null 2>&1; then
+            log_warn "APT 安装了 nvidia-smi 命令但 GPU 仍读不到（内核模块没加载），切换到 .run 路线兜底"
         fi
     fi
 
@@ -913,18 +939,59 @@ check_nvidia_driver() {
     # ═══════════════════════════════════════════════════════
     if [ "${apt_ok}" != "true" ]; then
         if [ "${apt_tried}" = "true" ]; then
-            log_warn "APT 驱动安装后仍无 nvidia-smi，自动切换到 .run 直装路线（绕开 apt，稳定性最高）"
+            log_warn "APT 驱动安装后仍无可用 nvidia-smi，自动切换到 .run 直装路线（绕开 apt，稳定性最高）"
         elif [ "${SKIP_SYSTEM_APT}" = "true" ]; then
             log_info "--skip-system-apt 生效，直接走 .run 直装路线"
         fi
         # 调用 auto_install_driver_cuda_runfile() 一次性装好驱动+CUDA
         if auto_install_driver_cuda_runfile; then
-            return 0
+            # ★ runfile 装完后再验证一次，如果还不行就输出明确的重启+nouveau+SecureBoot指引
+            if verify_driver_loaded; then
+                return 0
+            fi
+            log_warn ".run 安装完成但 GPU 仍不可见。驱动内核模块加载是关键卡点，下面会给明确处理步骤"
+        else
+            log_error "驱动安装（APT + .run 双路线）均失败"
+            return 1
         fi
-        log_error "驱动安装（APT + .run 双路线）均失败"
-        return 1
     fi
-    return 0
+
+    # ═══════════════════════════════════════════════════════
+    # ★ 到这里：文件都装好了但内核模块没加载 → 做最后抢救
+    # ═══════════════════════════════════════════════════════
+    log_info "🔧 最后抢救：重新黑名单 nouveau + 重建 initramfs + dkms 全量编译"
+    # 1. nouveau 黑名单（不管之前有没有写过，强制再写一次）
+    sudo tee /etc/modprobe.d/blacklist-nouveau.conf >/dev/null <<'EOF'
+blacklist nouveau
+options nouveau modeset=0
+EOF
+    sudo update-initramfs -u -k all 2>&1 | tee -a "${LOG_FILE}" || true
+    # 2. dkms 重建所有 nvidia 模块
+    local kver
+    kver="$(uname -r)"
+    ( sudo apt-get install -y --no-install-recommends "linux-headers-${kver}" 2>&1 | tee -a "${LOG_FILE}" ) || true
+    ( sudo dkms autoinstall -k "${kver}" 2>&1 | tee -a "${LOG_FILE}" ) || true
+    ( sudo depmod -a 2>&1 | tee -a "${LOG_FILE}" ) || true
+    # 3. 先卸 nouveau 再加载 nvidia（如果没在图形界面里）
+    ( sudo rmmod nouveau 2>&1 | tee -a "${LOG_FILE}" ) || true
+    ( sudo modprobe nvidia nvidia_modeset nvidia_uvm nvidia_drm 2>&1 | tee -a "${LOG_FILE}" ) || true
+
+    if verify_driver_loaded; then
+        log_ok "🎉 抢救成功！GPU 已识别（建议还是 reboot 一次保证长期稳定）"
+        return 0
+    fi
+
+    # ── 实在不行了，明确告诉用户为什么 ──
+    log_error "================================================================="
+    log_error "❌ 驱动文件都装好了，但内核模块就是加载不出来。最常见 3 个原因："
+    log_error "  1️⃣  Secure Boot 开着（BIOS 里启用了 MOK 签名）→ 进 BIOS 关闭 Secure Boot"
+    log_error "  2️⃣  nouveau 还占着设备（initramfs 里还没清掉）→ 必须 sudo reboot"
+    log_error "  3️⃣  linux-headers 版本不匹配当前内核 → 看上面 dkms autoinstall 报错"
+    log_error ""
+    log_error "👉 请现在执行：sudo reboot"
+    log_error "   重启后不要再手工装任何东西，直接再执行一次 ./gpu_test.sh 就能直接进测试"
+    log_error "================================================================="
+    return 1
 }
 
 # ==================== 顺序16: install_cuda_toolkit() ====================
@@ -932,6 +999,22 @@ install_cuda_toolkit() {
     log_info "===== CUDA Toolkit 检查/安装 ====="
     # ★ 第一步：HTTP探测真实存在的CUDA版本（彻底解决404）
     probe_cuda_runfile
+
+    # ★★ 关键：如果当前连 nvidia-smi 驱动都没有 → 直接走【驱动+CUDA 全量安装】，不能只装 toolkit
+    if ! command -v nvidia-smi >/dev/null 2>&1; then
+        log_warn "⚠️  驱动都没装，直接调用 auto_install_driver_cuda_runfile() 一次性装好 驱动+CUDA+samples"
+        auto_install_driver_cuda_runfile
+        # 无论成功失败，都再检查一次 nvcc 能不能找到 samples 编译
+        if command -v nvcc >/dev/null 2>&1; then
+            compile_cuda_samples
+            return 0
+        fi
+        log_error "全量安装后 nvcc 仍不可用，CUDA 相关测试会被跳过"
+        mkdir -p "${OUTPUT_DIR}/cuda_samples_bin"
+        echo "${OUTPUT_DIR}/cuda_samples_bin" > "${CUDA_BIN_DIR_FILE}"
+        return 1
+    fi
+
     if [ "${SKIP_CUDA}" = "true" ]; then
         log_info "--skip-cuda 生效：跳过 CUDA Toolkit 下载/安装"
         if command -v nvcc >/dev/null 2>&1; then
@@ -969,7 +1052,7 @@ install_cuda_toolkit() {
     fi
     if [ "${NET_REACHABLE_CACHED}" != "yes" ]; then
         log_warn "网络不可达，跳过CUDA自动安装（可手动下载runfile后执行）"
-        log_info "手动命令: wget ${CUDA_URL} -O /tmp/${CUDA_RUNFILE} && sudo sh /tmp/${CUDA_RUNFILE} --silent --toolkit --samples --samplespath=/usr/local/cuda/samples --override"
+        log_info "手动命令: wget ${CUDA_URL} -O /tmp/${CUDA_RUNFILE} && sudo sh /tmp/${CUDA_RUNFILE} --silent --driver --toolkit --samples --samplespath=/usr/local/cuda/samples --override --no-opengl-files"
         mkdir -p "${OUTPUT_DIR}/cuda_samples_bin"
         echo "${OUTPUT_DIR}/cuda_samples_bin" > "${CUDA_BIN_DIR_FILE}"
         return 1
@@ -998,8 +1081,9 @@ install_cuda_toolkit() {
     fi
     chmod +x "/tmp/${CUDA_RUNFILE}" 2>/dev/null || true
 
-    log_info "安装 CUDA toolkit + samples 中（大概 5~10 分钟）..."
-    ( sudo sh "/tmp/${CUDA_RUNFILE}" --silent --toolkit --samples --samplespath=/usr/local/cuda/samples --override --no-opengl-files ) 2>&1 | tee -a "${LOG_FILE}" || true
+    # ★★ 修复历史 bug：这里必须带上 --driver！！！否则只装了 toolkit，nvidia-smi 找不到（虽然上面已经确保有驱动了，但加上更稳）
+    log_info "安装 NVIDIA 驱动 + CUDA toolkit + samples 中（大概 5~10 分钟）..."
+    ( sudo sh "/tmp/${CUDA_RUNFILE}" --silent --driver --toolkit --samples --samplespath=/usr/local/cuda/samples --override --no-opengl-files --no-x-check ) 2>&1 | tee -a "${LOG_FILE}" || true
 
     export PATH="/usr/local/cuda/bin:${PATH}"
     export LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH}"
@@ -1150,6 +1234,34 @@ install_factory_tools() {
     local status_nvbandwidth="MISSING"
     local status_gpu_burn="MISSING"
     local status_cuda_memtest="MISSING"
+
+    # ── 0. 【前置抢救】g++ 不存在？尝试强制装 build-essential（跨版本 gcc 冲突也硬解）──
+    if ! command -v g++ >/dev/null 2>&1 && [ "${SKIP_SYSTEM_APT}" != "true" ]; then
+        log_info "🔧 检测到 g++ 未安装，开始尝试多种方式强制安装 build-essential / g++..."
+        # 0.1 再跑一次修复，清 held / 补 missing deps
+        ( sudo DEBIAN_FRONTEND=noninteractive apt-get install -f -y --fix-broken 2>&1 | tee -a "${LOG_FILE}" ) || true
+        # 0.2 full-upgrade 让 gcc 版本自然降级（如 24.10 gcc-14 → 24.04 gcc-13 冲突）
+        ( sudo DEBIAN_FRONTEND=noninteractive apt-get -y --allow-downgrades --allow-remove-essential --allow-change-held-packages full-upgrade 2>&1 | tee -a "${LOG_FILE}" ) || true
+        # 0.3 装 build-essential 主包
+        ( sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends --fix-missing --allow-downgrades build-essential 2>&1 | tee -a "${LOG_FILE}" ) || true
+        # 0.4 主包失败 → 逐个拆着装（g++/gcc/make/libc-dev 都强制）
+        if ! command -v g++ >/dev/null 2>&1; then
+            local split_pkgs=(g++ gcc make libc6-dev dpkg-dev binutils libstdc++-13-dev libgcc-13-dev libc6)
+            local pp
+            for pp in "${split_pkgs[@]}"; do
+                ( sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends --fix-missing --allow-downgrades --fix-broken "${pp}" 2>&1 | tee -a "${LOG_FILE}" ) || true
+            done
+        fi
+        # 0.5 再不行就 --force-depends 极端保底
+        if ! command -v g++ >/dev/null 2>&1; then
+            ( sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --force-depends g++ make 2>&1 | tee -a "${LOG_FILE}" ) || true
+        fi
+        if command -v g++ >/dev/null 2>&1; then
+            log_ok "✅ g++ 抢救安装成功（版本: $(g++ --version | head -n1)）"
+        else
+            log_warn "⚠️  g++ 还是没装上，gpu-burn / cuda-memtest 两个需编译的工具会被跳过（不影响其余官方测试）"
+        fi
+    fi
 
     if [ -f /usr/local/cuda/bin/cuda-memcheck ]; then
         cp /usr/local/cuda/bin/cuda-memcheck "${FACTORY_BIN}/" 2>/dev/null || true
