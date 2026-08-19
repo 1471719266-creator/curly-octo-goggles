@@ -618,6 +618,7 @@ compile_cuda_samples() {
 
 # =========================================
 # 4. NVIDIA DCGM 安装（官方数据中心权威诊断工具）
+#   策略：curl 不存在时跳过 wget 替代 → apt 直接装 → 全部失败只告警
 # =========================================
 install_dcgm() {
     log_info "========== 4. NVIDIA DCGM 数据中心诊断工具安装 =========="
@@ -627,24 +628,70 @@ install_dcgm() {
         return 0
     fi
 
-    log_info "安装 NVIDIA DCGM（官方数据中心GPU权威诊断工具）..."
+    log_info "尝试安装 NVIDIA DCGM（官方数据中心GPU权威诊断工具）..."
 
-    # DCGM 官方仓库
-    curl -s -L https://nvidia.github.io/DCGM/gpgkey | sudo apt-key add - >> "${LOG_FILE}" 2>&1
-    OS_VER="ubuntu24.04"
-    curl -s -L "https://nvidia.github.io/DCGM/${OS_VER}/x86_64/DCGM.list" | \
-        sudo tee /etc/apt/sources.list.d/dcgm.list >/dev/null
-    sudo apt-get update -y >> "${LOG_FILE}" 2>&1
-    sudo apt-get install -y datacenter-gpu-manager >> "${LOG_FILE}" 2>&1
+    local have_curl=false
+    local have_wget=false
+    command -v curl &>/dev/null && have_curl=true
+    command -v wget &>/dev/null && have_wget=true
 
-    # 启动DCGM服务
-    sudo systemctl enable --now nvidia-dcgm.service >> "${LOG_FILE}" 2>&1 || true
-    sleep 2
+    local installed_ok=false
+
+    # 方式A：官方 NVIDIA DCGM 仓库（优先 curl，其次 wget）
+    if [ "${have_curl}" = "true" ] || [ "${have_wget}" = "true" ]; then
+        OS_VER="ubuntu24.04"
+        local gpg_key_added=false
+        if [ "${have_curl}" = "true" ]; then
+            ( curl -s -L --max-time 20 https://nvidia.github.io/DCGM/gpgkey 2>/dev/null | sudo apt-key add - >> "${LOG_FILE}" 2>&1 ) && gpg_key_added=true
+        fi
+        if [ "${gpg_key_added}" = "false" ] && [ "${have_wget}" = "true" ]; then
+            ( wget -q --timeout=20 -O - https://nvidia.github.io/DCGM/gpgkey 2>/dev/null | sudo apt-key add - >> "${LOG_FILE}" 2>&1 ) && gpg_key_added=true
+        fi
+
+        if [ "${gpg_key_added}" = "true" ]; then
+            local list_written=false
+            if [ "${have_curl}" = "true" ]; then
+                ( curl -s -L --max-time 20 "https://nvidia.github.io/DCGM/${OS_VER}/x86_64/DCGM.list" 2>/dev/null | \
+                    sudo tee /etc/apt/sources.list.d/dcgm.list >/dev/null ) && list_written=true
+            fi
+            if [ "${list_written}" = "false" ] && [ "${have_wget}" = "true" ]; then
+                ( wget -q --timeout=20 -O - "https://nvidia.github.io/DCGM/${OS_VER}/x86_64/DCGM.list" 2>/dev/null | \
+                    sudo tee /etc/apt/sources.list.d/dcgm.list >/dev/null ) && list_written=true
+            fi
+
+            if [ "${list_written}" = "true" ]; then
+                ( sudo apt-get update -y >> "${LOG_FILE}" 2>&1 ) || true
+                if ( sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends datacenter-gpu-manager >> "${LOG_FILE}" 2>&1 ); then
+                    installed_ok=true
+                fi
+            fi
+        fi
+    else
+        log_warn "⚠️  curl/wget 均未安装，无法添加 NVIDIA DCGM 仓库"
+    fi
+
+    # 方式B：直接用 apt search 看看有没有现成的 datacenter-gpu-manager（某些系统已带）
+    if [ "${installed_ok}" = "false" ]; then
+        if ( sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends datacenter-gpu-manager >> "${LOG_FILE}" 2>&1 ); then
+            installed_ok=true
+        fi
+    fi
+
+    # 启动DCGM服务（无论哪种方式装上的，都尝试启动）
+    if [ "${installed_ok}" = "true" ] || command -v dcgmi &>/dev/null; then
+        ( sudo systemctl enable --now nvidia-dcgm.service >> "${LOG_FILE}" 2>&1 ) || true
+        sleep 2
+    fi
 
     if command -v dcgmi &>/dev/null; then
         log_ok "DCGM 安装并启动成功"
     else
-        log_warn "DCGM 安装失败（消费级GPU可能不支持），将使用nvidia-smi替代"
+        log_warn "DCGM 未安装（可能：无网络 / curl&wget均缺失 / 源不可达）"
+        log_warn "  手动恢复命令（连上网后执行）："
+        log_warn "    sudo apt install -y curl wget && curl -s -L https://nvidia.github.io/DCGM/gpgkey | sudo apt-key add -"
+        log_warn "    curl -s -L https://nvidia.github.io/DCGM/ubuntu24.04/x86_64/DCGM.list | sudo tee /etc/apt/sources.list.d/dcgm.list"
+        log_warn "    sudo apt update && sudo apt install -y datacenter-gpu-manager && sudo systemctl enable --now nvidia-dcgm"
+        log_warn "  当前脚本将使用 nvidia-smi 替代完成诊断（结果稍弱但可用）"
     fi
 }
 
@@ -668,6 +715,33 @@ install_factory_tools() {
     export PATH="/usr/local/cuda/bin:${PATH}"
     export LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH}"
 
+    # 前置判断：连外网 & 有下载工具吗？ 没的话直接跳过下载，不浪费时间
+    local have_downloader=false
+    command -v git &>/dev/null && have_downloader=true
+    command -v wget &>/dev/null && have_downloader=true
+    command -v curl &>/dev/null && have_downloader=true
+
+    local net_reachable=false
+    if [ "${have_downloader}" = "true" ]; then
+        ( timeout 5 bash -c 'echo > /dev/tcp/github.com/443' &>/dev/null ) && net_reachable=true || \
+        ( timeout 5 bash -c 'echo > /dev/tcp/mirrors.aliyun.com/80' &>/dev/null ) && net_reachable=true || true
+    fi
+
+    local skip_download=false
+    if [ "${have_downloader}" = "false" ]; then
+        log_warn "⚠️  curl/wget/git 均未安装，无法下载 gpu-burn / cuda_memtest 源码，已自动跳过下载"
+        skip_download=true
+    elif [ "${net_reachable}" = "false" ]; then
+        log_warn "⚠️  检测不到外网连通性，跳过 gpu-burn / cuda_memtest 下载编译"
+        skip_download=true
+    fi
+    if [ "${skip_download}" = "true" ]; then
+        log_warn "    手动恢复（连网后执行）："
+        log_warn "      sudo apt install -y git wget curl build-essential"
+        log_warn "      然后重跑脚本（加 --skip-install 跳过已完成的安装阶段）"
+        log_warn "    原厂 cuda-memcheck/nvbandwidth 检测将照常执行。"
+    fi
+
     # ================================================================
     # 工具1: gpu-burn（满载烧机+正确性校验）
     # ================================================================
@@ -681,7 +755,7 @@ install_factory_tools() {
         gb_ok=true
     fi
 
-    if [ "${gb_ok}" = "false" ]; then
+    if [ "${gb_ok}" = "false" ] && [ "${skip_download}" = "false" ]; then
         log_info "[1/2] 下载 gpu-burn ..."
         rm -rf "${GB_DIR}"
         mkdir -p "${GB_DIR}"
@@ -784,7 +858,7 @@ install_factory_tools() {
         cm_ok=true
     fi
 
-    if [ "${cm_ok}" = "false" ]; then
+    if [ "${cm_ok}" = "false" ] && [ "${skip_download}" = "false" ]; then
         log_info "[2/2] 下载 cuda_memtest ..."
         rm -rf "${CM_DIR}"
         mkdir -p "${CM_DIR}"
