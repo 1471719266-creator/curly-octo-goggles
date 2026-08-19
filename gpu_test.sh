@@ -146,6 +146,258 @@ run_apt_safe() {
     done
 }
 
+# ==================== 顺序5b: fix_apt_sources() 全自动修复失效Ubuntu源（404 / oracular 等）====================
+fix_apt_sources() {
+    if [ "${SKIP_SYSTEM_APT}" = "true" ]; then
+        log_info "--skip-system-apt 生效，跳过APT源修复"
+        return 0
+    fi
+    # 只在 /etc/apt/sources.list 存在的Ubuntu系统里跑
+    [ -f /etc/os-release ] || return 0
+    [ -f /etc/apt/sources.list ] || return 0
+    local os_id=""
+    os_id="$(grep -E '^ID=' /etc/os-release | cut -d= -f2 | tr -d '"')"
+    [ "${os_id}" != "ubuntu" ] && return 0
+
+    # 探测是否需要修：执行一次 apt update（超短超时）看是否 404 / no Release file
+    local need_fix=false
+    local probe_out=""
+    probe_out="$(sudo timeout 30 apt-get update 2>&1 || true)"
+    if echo "${probe_out}" | grep -qE '404[[:space:]]+Not Found|does not have a Release file|no longer has a Release file|is not available'; then
+        need_fix=true
+    fi
+    # 兜底：如果版本代号本身就是已知失效版（oracular=24.10 interim）直接修
+    local version_codename=""
+    version_codename="$(grep -E '^VERSION_CODENAME=' /etc/os-release | cut -d= -f2 | tr -d '"')"
+    case "${version_codename}" in
+        oracular|mantic|lunar|kinetic|jammy-backports)  need_fix=true ;;
+    esac
+
+    if [ "${need_fix}" = "false" ]; then
+        log_ok "APT源检测正常，跳过自动修复"
+        return 0
+    fi
+
+    log_warn "🔧 检测到 APT 源 404/失效（codename=${version_codename}），开始自动替换为清华 Ubuntu 24.04 LTS (noble) 源..."
+
+    # ── 1. 备份 ──
+    local bak="/etc/apt/sources.list.gpu_test_bak_$(date +%Y%m%d_%H%M%S)"
+    sudo cp -a /etc/apt/sources.list "${bak}" 2>/dev/null || true
+    log_info "原 sources.list 已备份到: ${bak}"
+
+    # ── 2. 清掉 /etc/apt/sources.list.d/*.list 里的 ubuntu 官方源（hk.archive等），保留第三方PPA（graphics-drivers/nvidia-cuda/dcgm）──
+    local d_list=""
+    for d_list in /etc/apt/sources.list.d/*.list; do
+        [ -f "${d_list}" ] || continue
+        # 只删包含 archive.ubuntu.com / security.ubuntu.com / hk. / cn. 的行，保留其他 PPA
+        sudo sed -i -E '/(archive|security)\.ubuntu\.com/d' "${d_list}" 2>/dev/null || true
+    done
+    sudo rm -f /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
+
+    # ── 3. 写入新 sources.list：清华 noble 24.04 LTS 源（全球/国内都能用）──
+    sudo tee /etc/apt/sources.list >/dev/null 2>&1 <<'APT_EOF'
+deb https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ noble main restricted universe multiverse
+deb https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ noble-updates main restricted universe multiverse
+deb https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ noble-backports main restricted universe multiverse
+deb http://security.ubuntu.com/ubuntu/ noble-security main restricted universe multiverse
+APT_EOF
+
+    # ── 4. 如清华源不可达（纯海外网络），fallback 回官方 archive ──
+    if ! (echo > /dev/tcp/mirrors.tuna.tsinghua.edu.cn/443) >/dev/null 2>&1; then
+        log_info "清华源TCP不可达（可能是海外网络），切换到官方 archive.ubuntu.com noble 源"
+        sudo tee /etc/apt/sources.list >/dev/null 2>&1 <<'APT_EOF'
+deb http://archive.ubuntu.com/ubuntu/ noble main restricted universe multiverse
+deb http://archive.ubuntu.com/ubuntu/ noble-updates main restricted universe multiverse
+deb http://archive.ubuntu.com/ubuntu/ noble-backports main restricted universe multiverse
+deb http://security.ubuntu.com/ubuntu/ noble-security main restricted universe multiverse
+APT_EOF
+    fi
+
+    # ── 5. 锁 + 清 + update ──
+    sudo rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock 2>/dev/null || true
+    sudo rm -rf /var/lib/apt/lists/* 2>/dev/null || true
+    sudo mkdir -p /var/lib/apt/lists/partial 2>/dev/null || true
+    local rc=0
+    sudo DEBIAN_FRONTEND=noninteractive apt-get update --fix-missing --allow-releaseinfo-change 2>&1 | tee -a "${LOG_FILE}" || rc=$?
+    if [ "${rc}" -ne 0 ]; then
+        log_warn "APT修复第一次失败，尝试 dpkg --configure + -f install ..."
+        ( sudo dpkg --configure -a --force-confdef --force-confold 2>&1 | tee -a "${LOG_FILE}" ) || true
+        ( sudo DEBIAN_FRONTEND=noninteractive apt-get install -f -y --fix-broken 2>&1 | tee -a "${LOG_FILE}" ) || true
+        sudo DEBIAN_FRONTEND=noninteractive apt-get update --fix-missing 2>&1 | tee -a "${LOG_FILE}" || rc=$?
+    fi
+    if [ "${rc}" -eq 0 ]; then
+        log_ok "✅ APT 源自动修复完成（noble 24.04 LTS 源已生效）"
+        # 顺便把 build-essential 补了，后面 gpu-burn 要用
+        ( sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential dkms linux-headers-$(uname -r) 2>&1 | tee -a "${LOG_FILE}" ) || true
+        return 0
+    fi
+    log_error "APT 自动修复仍失败，但后续会用 .run 直装驱动+CUDA（不依赖apt继续跑）"
+    return 1
+}
+
+# ==================== 顺序5c: auto_install_driver_cuda_runfile() 全自动 .run 直装驱动+CUDA（绕开apt）====================
+auto_install_driver_cuda_runfile() {
+    local CUDA_RUNFILE="cuda_${CUDA_VERSION}_${CUDA_RUNFILE_VERSION}_linux.run"
+    local CUDA_URL="https://developer.download.nvidia.com/compute/cuda/${CUDA_VERSION}/local_installers/${CUDA_RUNFILE}"
+    local runfile_path="/tmp/${CUDA_RUNFILE}"
+    local need_phase2=false
+
+    log_info "============================================================"
+    log_info "🚀 进入【全自动 NVIDIA 驱动 + CUDA 一体化安装】"
+    log_info "   使用 CUDA runfile 直装（不依赖 apt 源，404 场景也能跑通）"
+    log_info "============================================================"
+
+    # ── 1. 网络 + 下载工具检测 ──
+    if ! check_net_reachable; then
+        NET_REACHABLE_CACHED="no"
+        log_error "❌ 网络不可达，自动安装中断。请联网后重试"
+        return 1
+    fi
+    NET_REACHABLE_CACHED="yes"
+
+    if ! command -v wget >/dev/null 2>&1 && ! command -v curl >/dev/null 2>&1; then
+        # 连 wget 都没，尝试用 apt 紧急装 wget（源可能已经被 fix_apt_sources 修好）
+        log_warn "wget/curl 都不存在，紧急尝试 apt 装 wget..."
+        ( sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends wget ca-certificates 2>&1 | tee -a "${LOG_FILE}" ) || true
+    fi
+    if ! command -v wget >/dev/null 2>&1 && ! command -v curl >/dev/null 2>&1; then
+        log_error "❌ wget/curl 均不可用，无法下载 runfile。请手动执行：sudo apt-get install -y wget ca-certificates"
+        return 1
+    fi
+
+    # ── 2. 下载 CUDA runfile ──
+    if [ ! -f "${runfile_path}" ] || [ ! -s "${runfile_path}" ]; then
+        log_info "📥 开始下载 CUDA runfile（约 4GB，首次下载较慢，请耐心等待）:"
+        log_info "   URL: ${CUDA_URL}"
+        rm -f "${runfile_path}" 2>/dev/null || true
+        local dl_ok=false
+        if command -v wget >/dev/null 2>&1; then
+            ( cd /tmp && wget --tries=3 --timeout=30 --continue --show-progress "${CUDA_URL}" -O "${runfile_path}" ) 2>&1 | tee -a "${LOG_FILE}" && dl_ok=true || true
+        fi
+        if [ "${dl_ok}" = "false" ] && command -v curl >/dev/null 2>&1; then
+            ( cd /tmp && curl -L --retry 3 -C - -o "${runfile_path}" "${CUDA_URL}" ) 2>&1 | tee -a "${LOG_FILE}" && dl_ok=true || true
+        fi
+        if [ ! -f "${runfile_path}" ] || [ ! -s "${runfile_path}" ]; then
+            log_error "❌ runfile 下载失败。请手动下载到 /tmp/ 下，然后重跑脚本:"
+            echo "  wget ${CUDA_URL} -O /tmp/${CUDA_RUNFILE}"
+            return 1
+        fi
+        # 简易文件大小校验（正常 4G+，至少得 >3.5G 才算完整）
+        local fsz_kb
+        fsz_kb="$(du -k "${runfile_path}" 2>/dev/null | awk '{print $1}' || echo 0)"
+        if [ "${fsz_kb}" -lt 3500000 ] 2>/dev/null; then
+            log_warn "runfile 只有 ${fsz_kb} KB，可能不完整，尝试继续（安装器会自己再检查）"
+        else
+            log_ok "✅ runfile 下载完成（约 $((fsz_kb / 1024)) MB）"
+        fi
+    else
+        log_ok "📦 检测到已有 runfile：${runfile_path}，直接复用"
+    fi
+    chmod +x "${runfile_path}" 2>/dev/null || true
+
+    # ── 3. 关闭 nouveau 开源驱动 + 写入黑名单（防止和官方驱动抢设备）──
+    if lsmod 2>/dev/null | grep -q nouveau; then
+        log_info "🔧 检测到 nouveau 开源驱动正在运行，写入黑名单并重建 initramfs"
+        sudo tee /etc/modprobe.d/blacklist-nouveau.conf >/dev/null <<'EOF'
+blacklist nouveau
+options nouveau modeset=0
+EOF
+        sudo update-initramfs -u 2>&1 | tee -a "${LOG_FILE}" || true
+        log_warn "⚠️  nouveau 已加入黑名单，驱动安装完成后需要 reboot 才能完全生效"
+    fi
+
+    # ── 4. 检测图形界面（X/Wayland），决定是否切 tty ──
+    local x_running=false
+    local use_tty_switch=false
+    if [ -n "${DISPLAY}" ] || [ -n "${WAYLAND_DISPLAY}" ] || pidof Xorg >/dev/null 2>&1 || pidof gnome-shell >/dev/null 2>&1; then
+        x_running=true
+    fi
+    if [ "${x_running}" = "true" ]; then
+        log_warn "📺 检测到图形界面正在运行（桌面环境）"
+        log_info "   NVIDIA 驱动安装时建议切换到纯文字 tty 避免冲突"
+        log_info "   脚本将自动执行："
+        log_info "     1) sudo systemctl isolate multi-user.target  （切到 tty 文字界面）"
+        log_info "     2) 安装驱动 + CUDA"
+        log_info "     3) sudo systemctl isolate graphical.target   （安装完自动切回桌面）"
+        echo ""
+        log_warn "⚠️  切到 tty 后当前桌面会临时消失，装完自动回来，期间不要断电"
+        use_tty_switch=true
+    fi
+
+    # ── 5. 实际安装 ──
+    local install_rc=0
+    if [ "${use_tty_switch}" = "true" ]; then
+        # 把安装逻辑包到一个独立 stage2 脚本里，systemd isolate 后前台跑完再切回图形
+        local stage2="/tmp/gpu_test_install_stage2_$$.sh"
+        cat > "${stage2}" <<STAGE2_EOF
+#!/bin/bash
+# Stage2：在 multi-user.target 下安装驱动+CUDA
+echo ""
+echo "============================================================"
+echo " Stage2: 已切换到纯文字模式，开始安装 NVIDIA 驱动 + CUDA ..."
+echo "============================================================"
+sleep 2
+chmod +x "${runfile_path}"
+sudo sh "${runfile_path}" --silent --driver --toolkit --samples --samplespath=/usr/local/cuda/samples --override --no-opengl-files --no-x-check
+install_rc2=\$?
+echo "Stage2 安装完成 exit=\${install_rc2}"
+echo \${install_rc2} > /tmp/gpu_test_install_rc.txt
+sleep 2
+echo "正在切回图形界面..."
+sudo systemctl isolate graphical.target
+exit \${install_rc2}
+STAGE2_EOF
+        chmod +x "${stage2}"
+        log_info "⏱️  5 秒后自动切换到 tty 执行安装。你可以提前按 Ctrl+Alt+F3 看到 tty 输出..."
+        for i in $(seq 5 -1 1); do printf "\r  %d 秒后开始... " "${i}"; sleep 1; done; echo ""
+
+        # 启动 stage2：通过 setsid + fg 方式保证切 tty 后还能跑完
+        # 简单可靠方案：写入 rc.local 风格启动的替代——用 nohup 后台跑 + 前台 sleep 等待结果文件
+        sudo systemctl set-default multi-user.target 2>/dev/null || true
+        sudo systemctl isolate multi-user.target 2>/dev/null || true
+        sleep 5
+        # 直接在当前虚拟终端（我们仍在这个 bash 进程里）执行安装
+        log_info "📦 安装中（驱动+CUDA，大概 5~15 分钟）..."
+        ( sudo sh "${runfile_path}" --silent --driver --toolkit --samples --samplespath=/usr/local/cuda/samples --override --no-opengl-files --no-x-check ) 2>&1 | tee -a "${LOG_FILE}" || install_rc=$?
+        echo "${install_rc}" > /tmp/gpu_test_install_rc.txt
+        log_info "安装脚本 exit=${install_rc}，切回图形界面..."
+        sudo systemctl set-default graphical.target 2>/dev/null || true
+        sudo systemctl isolate graphical.target 2>/dev/null || true
+    else
+        # 已经在纯 tty/ssh 下，直接装
+        log_info "📦 安装中（驱动+CUDA，大概 5~15 分钟）..."
+        ( sudo sh "${runfile_path}" --silent --driver --toolkit --samples --samplespath=/usr/local/cuda/samples --override --no-opengl-files --no-x-check ) 2>&1 | tee -a "${LOG_FILE}" || install_rc=$?
+    fi
+
+    # ── 6. 收尾验证 ──
+    export PATH="/usr/local/cuda/bin:${PATH}"
+    export LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH}"
+    echo 'export PATH=/usr/local/cuda/bin:$PATH' | sudo tee /etc/profile.d/cuda.sh >/dev/null 2>&1 || true
+    echo 'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH' | sudo tee -a /etc/profile.d/cuda.sh >/dev/null 2>&1 || true
+
+    local drv_ok=false
+    local cuda_ok=false
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        drv_ok=true
+        log_ok "✅ nvidia-smi 就绪: $(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1 || echo unknown)"
+    fi
+    if command -v nvcc >/dev/null 2>&1; then
+        cuda_ok=true
+        log_ok "✅ nvcc 就绪: $(nvcc --version 2>/dev/null | grep -E 'release [0-9]' | head -n1 || echo unknown)"
+    fi
+
+    if [ "${drv_ok}" = "true" ] && [ "${cuda_ok}" = "true" ]; then
+        log_ok "🎉 驱动 + CUDA 全自动安装成功"
+        log_warn "⚠️  非常建议：现在执行 sudo reboot 重启一次（驱动内核模块 + nouveau 黑名单需要重启才 100% 生效）"
+        log_info "   如果不想重启，脚本也会尝试继续跑（部分场景不重启也能 OK）"
+        return 0
+    fi
+
+    log_error "❌ .run 安装完毕但工具未就绪（drv_ok=${drv_ok} cuda_ok=${cuda_ok}），请执行 sudo reboot 后重跑脚本"
+    log_info "诊断信息已保存，报告中会包含安装日志"
+    return 1
+}
+
 # ==================== 顺序6: 全局安全壳 trap ERR + ulimit -c 0 ====================
 trap 'log_error "Trap ERR: line=$LINENO cmd=$BASH_COMMAND rc=$?"' ERR
 ulimit -c 0 2>/dev/null || true
@@ -1665,13 +1917,28 @@ EOF
 
     start_temp_watchdog
 
+    # ═══════════════════════════════════════════════════════════════════
+    # Step 0: 启动先修 apt 源（自动检测 404/oracular 失效源）
+    # ═══════════════════════════════════════════════════════════════════
+    if [ "${SKIP_INSTALL}" = "false" ]; then
+        fix_apt_sources || true
+    fi
+
     if [ "${STRESS_ONLY}" = "true" ]; then
-        log_warn "模式: STRESS_ONLY（仅依赖/驱动/枚举/压力/报告，跳过大部分子测试）"
+        log_warn "模式: STRESS_ONLY（仅依赖/驱动/枚举/压力+报告，跳过大部分子测试）"
         install_system_deps
         check_system
-        check_nvidia_driver || true
+        # 驱动检查：先正常apt路线，失败立刻走全自动 .run 直装
+        if ! check_nvidia_driver; then
+            if [ "${SKIP_CUDA}" = "false" ]; then
+                log_info "apt路线驱动装不上，立即进入【全自动.run直装】驱动+CUDA"
+                auto_install_driver_cuda_runfile || true
+            fi
+        fi
         enumerate_gpus
-        install_cuda_toolkit || true
+        if ! command -v nvcc >/dev/null 2>&1 && [ "${SKIP_CUDA}" = "false" ]; then
+            install_cuda_toolkit || true
+        fi
         test_stress_thermal
         generate_final_report
         log_ok "STRESS_ONLY 模式全部完成 🎉"
@@ -1684,8 +1951,23 @@ EOF
         log_info "模式: 完整安装 + 测试"
         install_system_deps
         check_system
-        check_nvidia_driver || true
-        install_cuda_toolkit || true
+        # ── 驱动安装路线：apt → 全自动 .run 直装 fallback ──
+        local driver_ok=false
+        if check_nvidia_driver; then driver_ok=true; fi
+        if [ "${driver_ok}" = "false" ] && [ "${SKIP_SYSTEM_APT}" = "false" ]; then
+            # 再给apt一次机会（可能 fix_apt_sources 刚修好）
+            log_info "再次尝试 apt 路线驱动安装..."
+            if check_nvidia_driver; then driver_ok=true; fi
+        fi
+        # 如果 apt 路线还是失败，且用户没手动跳过 CUDA，直接走 .run 直装（驱动+CUDA 一起装）
+        if [ "${driver_ok}" = "false" ] && [ "${SKIP_CUDA}" = "false" ]; then
+            log_info "apt 路线驱动装不上 → 立即进入【全自动 .run 直装】驱动 + CUDA（绕开apt）"
+            if auto_install_driver_cuda_runfile; then driver_ok=true; fi
+        fi
+        # 只有当驱动好了，但 CUDA 单独没装时，才走 install_cuda_toolkit（优先 runfile 直装路线）
+        if ! command -v nvcc >/dev/null 2>&1 && [ "${SKIP_CUDA}" = "false" ]; then
+            install_cuda_toolkit || true
+        fi
         install_dcgm || true
         install_factory_tools
     else
