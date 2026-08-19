@@ -8,6 +8,116 @@
 set -o pipefail
 
 # ================================================================
+# 【第-2步：核心全局工具函数】（必须放在最前面，所有后续函数都依赖）
+#   1) check_net_reachable(): 网络可达检测（优先 ping，失败再 /dev/tcp）
+#   2) run_apt_safe(): apt 安全执行器（自动判断 SIGSEGV 崩溃 + 触发自愈）
+#   3) apt_selfcheck_repair(): 5 层 apt/dpkg 自愈（clean/lists/avail/configure/fix-missing）
+# ================================================================
+
+# ---------- 网络可达检测：优先 ping（实测证明用户 ICMP 通），失败再 /dev/tcp ----------
+check_net_reachable() {
+    # 先试 ping（-c 2 发2包, -W 3 等3秒, -q 安静）— ICMP 防火墙最不容易挡
+    local ping_targets=("mirrors.aliyun.com" "archive.ubuntu.com" "baidu.com" "github.com")
+    for t in "${ping_targets[@]}"; do
+        if ( ping -c 2 -W 3 -q "${t}" &>/dev/null ); then
+            return 0
+        fi
+    done
+    # ping 不通再试 /dev/tcp TCP 80/443（有些环境禁 ICMP 但开放 TCP）
+    local tcp_targets=("mirrors.aliyun.com:80" "archive.ubuntu.com:80" "github.com:443")
+    for tp in "${tcp_targets[@]}"; do
+        local host="${tp%:*}"
+        local port="${tp##*:}"
+        if ( timeout 5 bash -c "exec 3<>/dev/tcp/${host}/${port}" &>/dev/null ); then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# ---------- APT 5 层自愈：碰到 SIGSEGV / dpkg 损坏时自动跑 ----------
+apt_selfcheck_repair() {
+    log_warn "🔧 检测到 apt/dpkg 状态异常，开始 5 层自动修复..."
+    # 把当前 apt 配置和源写进日志，方便以后追溯
+    ( apt-get --version >> "${LOG_FILE}" 2>&1 ) || true
+    ( cat /etc/apt/sources.list >> "${LOG_FILE}" 2>&1 ) || true
+    ( ls -la /etc/apt/sources.list.d/ >> "${LOG_FILE}" 2>&1 ) || true
+
+    log_warn "  [修复1/5] 删除 apt/dpkg 锁 + dpkg --configure -a ..."
+    ( sudo rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend ) || true
+    ( sudo dpkg --configure -a --force-confdef --force-confold >> "${LOG_FILE}" 2>&1 ) || true
+
+    log_warn "  [修复2/5] apt clean + 清空 lists 目录（索引可能损坏导致段错误）..."
+    ( sudo apt-get clean >> "${LOG_FILE}" 2>&1 ) || true
+    ( sudo rm -rf /var/lib/apt/lists/* ) || true
+    ( sudo mkdir -p /var/lib/apt/lists/partial ) || true
+
+    log_warn "  [修复3/5] dpkg --clear-avail + --update-avail（清空可用包缓存）..."
+    ( sudo dpkg --clear-avail >> "${LOG_FILE}" 2>&1 ) || true
+    if [ -d "/var/lib/dpkg/info" ]; then
+        ( sudo dpkg --update-avail /var/lib/dpkg/available >> "${LOG_FILE}" 2>&1 ) || true
+    fi
+
+    log_warn "  [修复4/5] apt-get update --fix-missing（不设 --fix-missing 会一直拿坏索引）..."
+    ( sudo DEBIAN_FRONTEND=noninteractive apt-get update --fix-missing --allow-releaseinfo-change >> "${LOG_FILE}" 2>&1 ) || true
+
+    log_warn "  [修复5/5] apt-get -f install（修复缺依赖 / 半安装包）..."
+    ( sudo DEBIAN_FRONTEND=noninteractive apt-get install -f -y --fix-broken >> "${LOG_FILE}" 2>&1 ) || true
+
+    # 验证修复结果：跑一次 apt-cache stats（段错误的 apt 一般这里也崩）
+    log_warn "  修复完成，正在验证 apt 是否可用..."
+    if ( sudo apt-cache stats &>/dev/null ) && ( sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq >> "${LOG_FILE}" 2>&1 ); then
+        log_ok "apt/dpkg 状态已修复，后续安装继续"
+        return 0
+    else
+        log_error "═══════════════════════════════════════════════════════════════"
+        log_error "❌ 自动修复 5 层都没搞定 —— apt/dpkg 仍然 segfault / 损坏"
+        log_error "═══════════════════════════════════════════════════════════════"
+        log_error "⚠️  这不是脚本的 bug，是 Ubuntu 系统自身的包管理器损坏（apt 崩溃）"
+        log_error "手动修复建议（依次尝试）："
+        log_error "  方案1（最快）：从其他相同版本 24.10 机器拷贝"
+        log_error "    sudo cp -a /var/lib/dpkg/info/* /var/lib/dpkg/info.bak/  && sudo dpkg --configure -a"
+        log_error "  方案2（重装 apt 二进制）："
+        log_error "    sudo dpkg --remove --force-remove-reinstreq apt libapt-pkg6.0 2>/dev/null || true"
+        log_error "    从 packages.ubuntu.com 下载 apt_*.deb libapt-pkg6.0_*.deb"
+        log_error "    sudo dpkg -i /tmp/apt_*.deb /tmp/libapt-pkg6.0_*.deb"
+        log_error "  方案3（终极）：如果 H200 只是想先跑 nvidia-smi/压力，直接手动装驱动跳过 apt"
+        log_error "    从 NVIDIA 官网下载 .run 驱动：sudo sh NVIDIA-Linux-x86_64-*.run -s"
+        log_error "═══════════════════════════════════════════════════════════════"
+        log_error "脚本当前会继续，但所有 apt 安装步骤都会跳过，请按上述方案修复 apt 后再重跑"
+        return 1
+    fi
+}
+
+# ---------- apt 安全执行器：统一包裹所有 apt-get 调用 ----------
+#   用法：run_apt_safe [update|install|...] [args...]
+#   特性：子shell隔离 → exit 139(SIGSEGV) 触发自愈 → 最多重试 1 次
+run_apt_safe() {
+    local apt_action="$1"; shift
+    local -a apt_args=("$@")
+    local rc=0
+    local retried=false
+
+    while true; do
+        ( sudo DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" "${apt_action}" "${apt_args[@]}" >> "${LOG_FILE}" 2>&1 )
+        rc=$?
+        # exit 139 = 128 + 11 = SIGSEGV（段错误）
+        if [ "${rc}" -eq 139 ] || [ "${rc}" -eq 134 ]; then
+            log_error "⚠️  apt-get ${apt_action} 触发段错误（exit=${rc}），立即启动 apt_selfcheck_repair"
+            if apt_selfcheck_repair && [ "${retried}" = "false" ]; then
+                retried=true
+                log_warn "修复成功，重试一次 apt-get ${apt_action} ..."
+                continue
+            else
+                return "${rc}"
+            fi
+        fi
+        break
+    done
+    return "${rc}"
+}
+
+# ================================================================
 # 【第-1步：全局安全壳】捕获段错误/子进程崩溃，不让主脚本跟着崩
 #   照片里出现的 "Segmentation fault" 是 sudo apt-get install 子进程崩了
 #   （无网络/源损坏时 apt 偶发段错误），这里用 trap + 子shell 隔离
@@ -344,10 +454,9 @@ install_system_deps() {
 
         # --- 前置2：判断网络（能否解析 + 连到 Ubuntu 镜像或 NVIDIA）---
         local net_ok=true
-        if ! timeout 5 bash -c 'echo > /dev/tcp/archive.ubuntu.com/80' &>/dev/null && \
-           ! timeout 5 bash -c 'echo > /dev/tcp/mirrors.aliyun.com/80' &>/dev/null; then
+        if ! check_net_reachable; then
             net_ok=false
-            log_warn "⚠️  检测不到外网连通性，跳过系统依赖自动安装"
+            log_warn "⚠️  检测不到外网连通性（ping & TCP 均失败），跳过系统依赖自动安装"
             log_warn "    缺少: ${deps_missing[*]}"
             log_warn "    连上网后可手动执行: sudo apt update && sudo apt install -y ${deps_missing[*]}"
             log_warn "    脚本将继续运行，缺失工具对应的测试项会自动跳过"
@@ -355,16 +464,17 @@ install_system_deps() {
 
         if [ "${net_ok}" = "true" ]; then
             log_info "缺少依赖: ${deps_missing[*]}，正在逐个安装..."
-            # 先 apt update，失败忽略（可能本地缓存还能用）
-            ( sudo apt-get update -y >> "${LOG_FILE}" 2>&1 ) || \
-                log_warn "apt update 失败（源可能离线），继续尝试直接安装"
+            # 先 apt update（用 run_apt_safe 包裹，段错误自动自愈）
+            if ! run_apt_safe "update" "-y"; then
+                log_warn "apt update 失败（源可能离线/或 apt 仍损坏），继续尝试直接安装"
+            fi
 
             # 逐个安装，每个都独立判断，不因为一个失败影响其他
             local -a installed_ok=()
             local -a installed_fail=()
             for pkg in "${deps_missing[@]}"; do
-                # 用子shell包裹，避免 apt 自身段错误把主脚本带崩
-                if ( sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${pkg}" >> "${LOG_FILE}" 2>&1 ); then
+                # 用 run_apt_safe 包裹：段错误/SIGSEGV 自动触发 apt_selfcheck_repair
+                if run_apt_safe "install" "-y" "--no-install-recommends" "${pkg}"; then
                     if command -v "${pkg}" &>/dev/null || dpkg -s "${pkg}" &>/dev/null; then
                         installed_ok+=("${pkg}")
                         log_ok "  ✓ ${pkg} 安装完成"
@@ -388,10 +498,10 @@ install_system_deps() {
         fi
     fi
 
-    # build-essential：同样用子shell+不中断策略
+    # build-essential：同样 run_apt_safe
     if ! dpkg -s build-essential &>/dev/null; then
         log_info "尝试安装 build-essential（编译环境）..."
-        if ( sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential >> "${LOG_FILE}" 2>&1 ); then
+        if run_apt_safe "install" "-y" "--no-install-recommends" "build-essential"; then
             log_ok "build-essential 安装完成"
         else
             log_warn "build-essential 安装失败，编译 cuda-samples/gpu-burn 时可能报错（会自动跳过）"
@@ -456,7 +566,7 @@ check_system() {
 
 # =========================================
 # 2. NVIDIA 驱动检测与安装
-#   策略：所有 apt/sudo 子命令用子shell包裹隔离，失败只告警不exit
+#   策略：apt 统一走 run_apt_safe（段错误自动自愈），失败只告警不exit
 # =========================================
 check_nvidia_driver() {
     log_info "========== 2. NVIDIA 驱动检测 =========="
@@ -471,15 +581,14 @@ check_nvidia_driver() {
     log_warn "未检测到 nvidia-smi，开始自动安装 NVIDIA 驱动..."
     log_warn "【提示】如果自动安装失败，可手动执行后重启：sudo ubuntu-drivers autoinstall && sudo reboot"
 
-    # 所有 apt/sudo 用子shell包裹，避免 apt 段错误带崩主脚本
-    ( sudo apt-get update -y >> "${LOG_FILE}" 2>&1 ) || true
-    ( sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        ubuntu-drivers-common software-properties-common dkms build-essential \
-        >> "${LOG_FILE}" 2>&1 ) || true
+    # apt 全部走 run_apt_safe，段错误会自动触发 apt_selfcheck_repair
+    run_apt_safe "update" "-y" || true
+    run_apt_safe "install" "-y" "--no-install-recommends" \
+        ubuntu-drivers-common software-properties-common dkms build-essential || true
 
-    # PPA 添加
+    # PPA 添加（用子shell包裹，add-apt-repository 不走 run_apt_safe）
     ( sudo add-apt-repository -y -n ppa:graphics-drivers/ppa >> "${LOG_FILE}" 2>&1 ) || true
-    ( sudo apt-get update -y >> "${LOG_FILE}" 2>&1 ) || true
+    run_apt_safe "update" "-y" || true
 
     # 自动安装推荐的驱动（优先选择-server版本用于数据中心GPU）
     log_info "正在检测推荐驱动版本..."
@@ -490,7 +599,7 @@ check_nvidia_driver() {
     log_info "即将安装驱动: ${RECOMMENDED}"
 
     local drv_ok=false
-    if ( sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "${RECOMMENDED}" dkms >> "${LOG_FILE}" 2>&1 ); then
+    if run_apt_safe "install" "-y" "${RECOMMENDED}" dkms; then
         drv_ok=true
     fi
 
@@ -498,7 +607,7 @@ check_nvidia_driver() {
         log_ok "NVIDIA 驱动安装成功，建议重启系统后再次运行此脚本"
         log_warn "提示：部分服务器需在BIOS中禁用Secure Boot才能加载驱动模块"
     else
-        log_error "驱动自动安装失败（可能原因：无网络 / 源无签名 / Secure Boot）"
+        log_error "驱动自动安装失败（可能原因：apt损坏/源无签名/Secure Boot）"
         log_error "请手动执行后重启：sudo ubuntu-drivers autoinstall && sudo reboot"
         log_error "脚本继续运行后续检测，若驱动完全不可用会在 enumerate_gpus 门禁阶段给出明确提示"
     fi
@@ -532,9 +641,8 @@ install_cuda_toolkit() {
                     "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb" \
                     >> "${LOG_FILE}" 2>&1 ) || true
                 ( sudo dpkg -i /tmp/cuda-keyring.deb >> "${LOG_FILE}" 2>&1 ) || true
-                ( sudo apt-get update -y >> "${LOG_FILE}" 2>&1 ) || true
-                ( sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "cuda-toolkit-${CUDA_VERSION//./-}" \
-                    >> "${LOG_FILE}" 2>&1 ) || true
+                run_apt_safe "update" "-y" || true
+                run_apt_safe "install" "-y" "cuda-toolkit-${CUDA_VERSION//./-}" || true
             fi
         fi
 
@@ -723,8 +831,13 @@ install_factory_tools() {
 
     local net_reachable=false
     if [ "${have_downloader}" = "true" ]; then
-        ( timeout 5 bash -c 'echo > /dev/tcp/github.com/443' &>/dev/null ) && net_reachable=true || \
-        ( timeout 5 bash -c 'echo > /dev/tcp/mirrors.aliyun.com/80' &>/dev/null ) && net_reachable=true || true
+        # 优先 ping，再 TCP（和全局 check_net_reachable 一致，避免误判无网）
+        if ping -c 2 -W 3 -q github.com &>/dev/null || \
+           ping -c 2 -W 3 -q mirrors.aliyun.com &>/dev/null || \
+           ( timeout 5 bash -c "exec 3<>/dev/tcp/github.com/443" &>/dev/null ) || \
+           ( timeout 5 bash -c "exec 3<>/dev/tcp/mirrors.aliyun.com/80" &>/dev/null ); then
+            net_reachable=true
+        fi
     fi
 
     local skip_download=false
