@@ -1,11 +1,20 @@
 #!/bin/bash
 #===============================================================================
 # NVIDIA GPU 售后服务自动化测试脚本
-# 支持 Ubuntu 24.04 LTS，兼容 H100 ~ B300 全系列数据中心/消费级 GPU
+# 支持 Ubuntu 24.x 系列，兼容 H100 ~ B300 全系列数据中心/消费级 GPU
 # 测试工具：NVIDIA CUDA Toolkit (官方) + DCGM (官方数据中心诊断)
 # 直接复制使用：  bash gpu_test.sh    （首次会自动 chmod +x，下次可 ./gpu_test.sh）
 #===============================================================================
 set -o pipefail
+
+# ================================================================
+# 【第-1步：全局安全壳】捕获段错误/子进程崩溃，不让主脚本跟着崩
+#   照片里出现的 "Segmentation fault" 是 sudo apt-get install 子进程崩了
+#   （无网络/源损坏时 apt 偶发段错误），这里用 trap + 子shell 隔离
+# ================================================================
+trap 'echo -e "\033[1;33m[安全壳] 检测到非0退出码 $?，但主脚本继续运行（若为apt/sudo段错误属正常，已隔离）\033[0m" >&2' ERR 2>/dev/null || true
+# 屏蔽 SIGPIPE / 子shell SIGSEGV 向主脚本传导（Ubuntu上apt段错误会顺带影响父进程）
+ulimit -c 0 2>/dev/null || true
 
 # ================================================================
 # 【第0步：自授权+重启动】复制到任何目录都能 bash gpu_test.sh 直接运行
@@ -56,6 +65,8 @@ init() {
     MANUAL_PAUSE="${OUTPUT_DIR}/.manual_pause"
     TEMP_WATCHDOG_LOG="${OUTPUT_DIR}/watchdog_temp.log"
     rm -f "${PAUSE_MARKER}" "${MANUAL_PAUSE}" "${TEMP_WATCHDOG_LOG}"
+    # 写一个 crash 标记文件，即使主进程异常也能让下次知道上次没跑完
+    echo "STARTED $(date '+%Y-%m-%d %H:%M:%S')" > "${OUTPUT_DIR}/.session_marker"
 }
 
 # ================================================================
@@ -300,6 +311,11 @@ save_raw() {
 
 # =========================================
 # 0. 安装系统级依赖（wget/curl/git/lspci/python3 等基础工具）
+#   健壮性策略：
+#     1) 先尝试修复 apt/dpkg 损坏状态（如被其他进程锁、配置中断）
+#     2) 检测网络连通性，断网就跳过安装（不 exit）
+#     3) 逐个包安装，避免批量失败；任何失败只告警不终止
+#     4) 编译阶段再判断工具是否真的缺失，缺失则跳过对应测试
 # =========================================
 install_system_deps() {
     log_info "========== 0. 安装系统级依赖工具 =========="
@@ -316,24 +332,70 @@ install_system_deps() {
     command -v file    &>/dev/null || deps_missing+=("file")
     command -v ldd     &>/dev/null || deps_missing+=("libc-bin")
 
-    if [ ${#deps_missing[@]} -gt 0 ]; then
-        log_info "缺少依赖: ${deps_missing[*]}，正在安装..."
-        sudo apt-get update -y >> "${LOG_FILE}" 2>&1
-        sudo apt-get install -y "${deps_missing[@]}" >> "${LOG_FILE}" 2>&1
-        if [ $? -eq 0 ]; then
-            log_ok "系统依赖安装完成: ${deps_missing[*]}"
-        else
-            log_error "系统依赖安装失败，请手动执行: sudo apt-get install ${deps_missing[*]}"
-            exit 1
-        fi
-    else
+    if [ ${#deps_missing[@]} -eq 0 ]; then
         log_ok "系统依赖工具已就绪（wget/curl/git/lspci/python3/make/gcc）"
+    else
+        # --- 前置1：修复 dpkg/apt 可能的中断/锁状态（最多3种方式，都失败也不中断）---
+        log_info "自动修复 apt/dpkg 可能的损坏状态..."
+        ( sudo dpkg --configure -a >> "${LOG_FILE}" 2>&1 ) || true
+        ( sudo rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock* ) || true
+        ( sudo fuser -v /var/lib/dpkg/lock-frontend &>/dev/null && sudo killall -9 apt-get apt dpkg 2>/dev/null ) || true
+        sleep 1
+
+        # --- 前置2：判断网络（能否解析 + 连到 Ubuntu 镜像或 NVIDIA）---
+        local net_ok=true
+        if ! timeout 5 bash -c 'echo > /dev/tcp/archive.ubuntu.com/80' &>/dev/null && \
+           ! timeout 5 bash -c 'echo > /dev/tcp/mirrors.aliyun.com/80' &>/dev/null; then
+            net_ok=false
+            log_warn "⚠️  检测不到外网连通性，跳过系统依赖自动安装"
+            log_warn "    缺少: ${deps_missing[*]}"
+            log_warn "    连上网后可手动执行: sudo apt update && sudo apt install -y ${deps_missing[*]}"
+            log_warn "    脚本将继续运行，缺失工具对应的测试项会自动跳过"
+        fi
+
+        if [ "${net_ok}" = "true" ]; then
+            log_info "缺少依赖: ${deps_missing[*]}，正在逐个安装..."
+            # 先 apt update，失败忽略（可能本地缓存还能用）
+            ( sudo apt-get update -y >> "${LOG_FILE}" 2>&1 ) || \
+                log_warn "apt update 失败（源可能离线），继续尝试直接安装"
+
+            # 逐个安装，每个都独立判断，不因为一个失败影响其他
+            local -a installed_ok=()
+            local -a installed_fail=()
+            for pkg in "${deps_missing[@]}"; do
+                # 用子shell包裹，避免 apt 自身段错误把主脚本带崩
+                if ( sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${pkg}" >> "${LOG_FILE}" 2>&1 ); then
+                    if command -v "${pkg}" &>/dev/null || dpkg -s "${pkg}" &>/dev/null; then
+                        installed_ok+=("${pkg}")
+                        log_ok "  ✓ ${pkg} 安装完成"
+                    else
+                        installed_fail+=("${pkg}")
+                        log_warn "  ✗ ${pkg} apt返回成功但二进制仍缺失（可能是包名不对应）"
+                    fi
+                else
+                    installed_fail+=("${pkg}")
+                    log_warn "  ✗ ${pkg} 安装失败（详见日志，将跳过该工具对应测试）"
+                fi
+            done
+
+            if [ ${#installed_ok[@]} -gt 0 ]; then
+                log_ok "成功安装依赖: ${installed_ok[*]}"
+            fi
+            if [ ${#installed_fail[@]} -gt 0 ]; then
+                log_warn "以下依赖安装失败，后续对应测试会自动跳过: ${installed_fail[*]}"
+                log_warn "手动修复命令: sudo apt update && sudo apt install -y ${installed_fail[*]}"
+            fi
+        fi
     fi
 
-    # 确保 build-essential 完整（编译 cuda-samples 需要）
+    # build-essential：同样用子shell+不中断策略
     if ! dpkg -s build-essential &>/dev/null; then
-        log_info "安装 build-essential（编译环境）..."
-        sudo apt-get install -y build-essential >> "${LOG_FILE}" 2>&1
+        log_info "尝试安装 build-essential（编译环境）..."
+        if ( sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential >> "${LOG_FILE}" 2>&1 ); then
+            log_ok "build-essential 安装完成"
+        else
+            log_warn "build-essential 安装失败，编译 cuda-samples/gpu-burn 时可能报错（会自动跳过）"
+        fi
     fi
 }
 
@@ -360,10 +422,26 @@ check_system() {
 
     # 检测PCIe GPU设备
     log_info "扫描PCIe总线上的NVIDIA GPU..."
-    VGA_LIST=$(lspci | grep -i nvidia || true)
+    VGA_LIST=$(lspci 2>/dev/null | grep -i nvidia || true)
+    # 记录完整lspci输出（即使没找到GPU也记录，便于判断是lspci命令缺失还是真的没卡）
+    save_raw "lspci_full" lspci 2>/dev/null || true
     if [ -z "${VGA_LIST}" ]; then
-        log_error "未在PCIe总线上检测到任何NVIDIA GPU设备！"
-        log_error "请检查：1) GPU是否正确插入PCIe插槽 2) 电源是否连接 3) BIOS中是否禁用了GPU"
+        log_error "═══════════════════════════════════════════════════════════════"
+        log_error "❌ PCIe 总线上未检测到任何 NVIDIA GPU 设备"
+        log_error "═══════════════════════════════════════════════════════════════"
+        if ! command -v lspci &>/dev/null; then
+            log_error "原因：lspci 命令不存在（pciutils未安装）。"
+            log_error "解决：sudo apt install -y pciutils && sudo update-pciids && 重新运行脚本"
+        else
+            log_error "可能原因及排查："
+            log_error "  1) GPU 物理接触 → 关机后重新插拔 GPU，金手指用橡皮擦清洁"
+            log_error "  2) 供电未接 → 检查 PCIe 8pin/12pin 电源线是否插紧"
+            log_error "  3) BIOS 禁用 → 进 BIOS：设置 Above 4G Decoding=Enable, SR-IOV=Disable"
+            log_error "  4) 主板插槽损坏 → 换一个 PCIe x16 插槽测试"
+            log_error "  5) GPU 本身损坏 → 换一张已知正常的 GPU 交叉验证"
+        fi
+        log_error "═══════════════════════════════════════════════════════════════"
+        log_error "脚本在此停止（没有 GPU 就没有测试对象）。以上检查完成后重新运行。"
         exit 1
     fi
     log_ok "检测到以下PCIe GPU设备："
@@ -378,6 +456,7 @@ check_system() {
 
 # =========================================
 # 2. NVIDIA 驱动检测与安装
+#   策略：所有 apt/sudo 子命令用子shell包裹隔离，失败只告警不exit
 # =========================================
 check_nvidia_driver() {
     log_info "========== 2. NVIDIA 驱动检测 =========="
@@ -390,16 +469,17 @@ check_nvidia_driver() {
     fi
 
     log_warn "未检测到 nvidia-smi，开始自动安装 NVIDIA 驱动..."
+    log_warn "【提示】如果自动安装失败，可手动执行后重启：sudo ubuntu-drivers autoinstall && sudo reboot"
 
-    # 检查是否有apt源更新
-    sudo apt-get update -y >> "${LOG_FILE}" 2>&1
+    # 所有 apt/sudo 用子shell包裹，避免 apt 段错误带崩主脚本
+    ( sudo apt-get update -y >> "${LOG_FILE}" 2>&1 ) || true
+    ( sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ubuntu-drivers-common software-properties-common dkms build-essential \
+        >> "${LOG_FILE}" 2>&1 ) || true
 
-    # 安装ubuntu-drivers工具，自动推荐驱动
-    sudo apt-get install -y ubuntu-drivers-common software-properties-common dkms build-essential >> "${LOG_FILE}" 2>&1
-
-    # 使用官方proprietary GPU驱动PPA（包含最新数据中心驱动）
-    sudo add-apt-repository -y ppa:graphics-drivers/ppa >> "${LOG_FILE}" 2>&1
-    sudo apt-get update -y >> "${LOG_FILE}" 2>&1
+    # PPA 添加
+    ( sudo add-apt-repository -y -n ppa:graphics-drivers/ppa >> "${LOG_FILE}" 2>&1 ) || true
+    ( sudo apt-get update -y >> "${LOG_FILE}" 2>&1 ) || true
 
     # 自动安装推荐的驱动（优先选择-server版本用于数据中心GPU）
     log_info "正在检测推荐驱动版本..."
@@ -408,19 +488,25 @@ check_nvidia_driver() {
         RECOMMENDED="nvidia-driver-560-server"  # 默认回退到支持H100/B300的服务器驱动
     fi
     log_info "即将安装驱动: ${RECOMMENDED}"
-    sudo apt-get install -y "${RECOMMENDED}" dkms >> "${LOG_FILE}" 2>&1
 
-    if [ $? -eq 0 ]; then
+    local drv_ok=false
+    if ( sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "${RECOMMENDED}" dkms >> "${LOG_FILE}" 2>&1 ); then
+        drv_ok=true
+    fi
+
+    if [ "${drv_ok}" = "true" ] && command -v nvidia-smi &>/dev/null; then
         log_ok "NVIDIA 驱动安装成功，建议重启系统后再次运行此脚本"
         log_warn "提示：部分服务器需在BIOS中禁用Secure Boot才能加载驱动模块"
     else
-        log_error "驱动安装失败，请检查日志: ${LOG_FILE}"
-        exit 1
+        log_error "驱动自动安装失败（可能原因：无网络 / 源无签名 / Secure Boot）"
+        log_error "请手动执行后重启：sudo ubuntu-drivers autoinstall && sudo reboot"
+        log_error "脚本继续运行后续检测，若驱动完全不可用会在 enumerate_gpus 门禁阶段给出明确提示"
     fi
 }
 
 # =========================================
 # 3. CUDA Toolkit 下载与安装（官方权威测试工具来源）
+#   策略：下载/安装失败只告警不exit，后续测试按需跳过
 # =========================================
 install_cuda_toolkit() {
     log_info "========== 3. CUDA Toolkit 安装 =========="
@@ -431,50 +517,60 @@ install_cuda_toolkit() {
         log_ok "已安装 CUDA Toolkit 版本: ${CUDA_VER}"
     else
         log_info "开始下载并安装 CUDA Toolkit ${CUDA_VERSION}（官方runfile方式，避免驱动冲突）..."
+        log_warn "【提示】CUDA约4GB下载较慢，失败可手动装：wget ${CUDA_URL} && sudo sh ${CUDA_RUNFILE} --silent --toolkit"
 
         CUDA_RUNFILE="cuda_${CUDA_VERSION}_560.35.05_linux.run"
         CUDA_URL="https://developer.download.nvidia.com/compute/cuda/${CUDA_VERSION}/local_installers/${CUDA_RUNFILE}"
 
         if [ ! -f "/tmp/${CUDA_RUNFILE}" ]; then
             log_info "正在下载 CUDA Toolkit，请耐心等待（约4GB）..."
-            wget -q --show-progress -O "/tmp/${CUDA_RUNFILE}" "${CUDA_URL}" 2>&1 | tee -a "${LOG_FILE}"
-            if [ $? -ne 0 ]; then
-                log_error "CUDA下载失败，尝试使用apt方式安装..."
-                # apt fallback
-                wget -qO /tmp/cuda-keyring.deb \
-                    "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb"
-                sudo dpkg -i /tmp/cuda-keyring.deb >> "${LOG_FILE}" 2>&1
-                sudo apt-get update -y >> "${LOG_FILE}" 2>&1
-                sudo apt-get install -y "cuda-toolkit-${CUDA_VERSION//./-}" >> "${LOG_FILE}" 2>&1
+            # 用子shell包裹，wget失败不影响主流程
+            if ! ( wget -q --show-progress -O "/tmp/${CUDA_RUNFILE}" "${CUDA_URL}" >> "${LOG_FILE}" 2>&1 ); then
+                log_warn "wget下载失败，尝试apt方式安装cuda-toolkit..."
+                # apt fallback（全部子shell包裹）
+                ( wget -qO /tmp/cuda-keyring.deb \
+                    "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb" \
+                    >> "${LOG_FILE}" 2>&1 ) || true
+                ( sudo dpkg -i /tmp/cuda-keyring.deb >> "${LOG_FILE}" 2>&1 ) || true
+                ( sudo apt-get update -y >> "${LOG_FILE}" 2>&1 ) || true
+                ( sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "cuda-toolkit-${CUDA_VERSION//./-}" \
+                    >> "${LOG_FILE}" 2>&1 ) || true
             fi
         fi
 
         if [ -f "/tmp/${CUDA_RUNFILE}" ]; then
-            chmod +x "/tmp/${CUDA_RUNFILE}"
+            ( chmod +x "/tmp/${CUDA_RUNFILE}" ) || true
             log_info "正在以静默方式安装 CUDA Toolkit（不装驱动，只装工具链和samples）..."
-            sudo "/tmp/${CUDA_RUNFILE}" --silent --toolkit --samples --samplespath=/usr/local/cuda/samples \
-                --override >> "${LOG_FILE}" 2>&1 || {
-                log_warn "runfile方式可能遇到问题，尝试仅安装toolkit包"
-            }
+            ( sudo "/tmp/${CUDA_RUNFILE}" --silent --toolkit --samples --samplespath=/usr/local/cuda/samples \
+                --override >> "${LOG_FILE}" 2>&1 ) || \
+                log_warn "runfile方式安装有告警，继续检查是否安装成功"
         fi
     fi
 
-    # 设置PATH
+    # 设置PATH（即使没装上也先设置好，避免后续手动装完立刻生效）
     export PATH="/usr/local/cuda/bin:${PATH}"
     export LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH}"
-    echo 'export PATH="/usr/local/cuda/bin:$PATH"' | sudo tee /etc/profile.d/cuda.sh >/dev/null
-    echo 'export LD_LIBRARY_PATH="/usr/local/cuda/lib64:$LD_LIBRARY_PATH"' | sudo tee -a /etc/profile.d/cuda.sh >/dev/null
+    ( echo 'export PATH="/usr/local/cuda/bin:$PATH"' | sudo tee /etc/profile.d/cuda.sh >/dev/null ) || true
+    ( echo 'export LD_LIBRARY_PATH="/usr/local/cuda/lib64:$LD_LIBRARY_PATH"' | sudo tee -a /etc/profile.d/cuda.sh >/dev/null ) || true
 
     # 确认nvcc
     if command -v nvcc &>/dev/null; then
         log_ok "CUDA Toolkit 安装完成: $(nvcc --version | grep release | tr -s ' ')"
     else
-        log_error "CUDA Toolkit 安装失败，请检查网络或手动安装"
-        exit 1
+        log_error "CUDA Toolkit 未安装或未找到 nvcc（可能：无网络 / 4GB大文件下载中断）"
+        log_error "后续 cuda-samples 编译、gpu-burn 编译会自动跳过，nvidia-smi/DCGM/ECC/PCIe链路等测试仍可运行"
+        log_error "恢复网络后可手动补装后重跑，或用 --skip-install 参数跳过安装阶段"
     fi
 
-    # 编译 cuda-samples 中的官方测试工具
-    compile_cuda_samples
+    # 编译 cuda-samples 中的官方测试工具（nvcc存在才编译）
+    if command -v nvcc &>/dev/null; then
+        compile_cuda_samples
+    else
+        log_warn "nvcc 不可用，跳过 cuda-samples 编译（后续官方测试会用nvidia-smi替代）"
+        # 写一个占位，避免后续 cat cuda_bin_dir.txt 报错
+        echo "${OUTPUT_DIR}/cuda_samples_bin" > "${OUTPUT_DIR}/cuda_bin_dir.txt"
+        mkdir -p "${OUTPUT_DIR}/cuda_samples_bin"
+    fi
 }
 
 compile_cuda_samples() {
@@ -858,8 +954,19 @@ enumerate_gpus() {
     fi
 
     if [ "${GPU_COUNT}" -eq 0 ]; then
-        log_error "GPU可用性门禁未通过：nvidia-smi无法枚举GPU，停止所有测试"
-        log_error "请检查驱动是否正确加载（lsmod | grep nvidia）、是否需要重启系统"
+        log_error "═══════════════════════════════════════════════════════════════"
+        log_error "❌ GPU 可用性门禁未通过：nvidia-smi 能看到 GPU 但无法枚举（驱动未正确加载）"
+        log_error "═══════════════════════════════════════════════════════════════"
+        log_error "驱动状态诊断："
+        log_error "  · lsmod 是否加载 nvidia 模块？→ 见下方 lsmod_nvidia.txt"
+        log_error "  · dmesg 中是否有 Xid/错误？   → 见下方 dmesg_nvidia.txt"
+        log_error "  · nvidia-smi -L 原始输出？     → 见下方 nvidia_smi_L.txt"
+        log_error "常见原因及解决："
+        log_error "  1) Secure Boot 拦截 → 进 BIOS 关闭 Secure Boot，重启"
+        log_error "  2) 内核版本不匹配 → sudo apt install linux-headers-\$(uname -r) 后重装驱动"
+        log_error "  3) 驱动未安装完成 → sudo ubuntu-drivers autoinstall，然后 sudo reboot"
+        log_error "  4) 新驱动装了但没重启 → 直接 sudo reboot（装完驱动必重启）"
+        log_error "═══════════════════════════════════════════════════════════════"
         save_raw "nvidia_smi_L" nvidia-smi -L
         save_raw "lsmod_nvidia" bash -c "lsmod | grep -i nvidia"
         save_raw "dmesg_nvidia" bash -c "dmesg | grep -i nvidia | tail -50"
