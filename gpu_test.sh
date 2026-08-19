@@ -168,6 +168,10 @@ FIELD_LEVEL=1
 TEMP_ALARM_C=90
 TEMP_COOLDOWN_C=$((TEMP_ALARM_C - 15))
 SKIP_INSTALL=false
+SKIP_SYSTEM_APT=false
+SKIP_CUDA=false
+SKIP_DCGM=false
+SKIP_TOOLS_BUILD=false
 STRESS_ONLY=false
 FORCE_FIELDIAG=false
 NET_REACHABLE_CACHED=""
@@ -353,7 +357,14 @@ install_system_deps() {
         fi
     done
 
-    if [ "${need_apt}" = "true" ]; then
+    if [ "${SKIP_SYSTEM_APT}" = "true" ]; then
+        if [ "${need_apt}" = "true" ]; then
+            log_warn "--skip-system-apt 生效：跳过apt安装缺失依赖: ${fail_deps[*]}"
+            log_info "（后续缺少 wget/curl/git/g++ 时对应的下载和编译会自动跳过）"
+        else
+            log_ok "所有基础依赖已就位，--skip-system-apt 不影响"
+        fi
+    elif [ "${need_apt}" = "true" ]; then
         if check_net_reachable; then
             NET_REACHABLE_CACHED="yes"
             log_info "网络可达，开始 apt 安装缺失依赖: ${fail_deps[*]}"
@@ -375,8 +386,11 @@ install_system_deps() {
         NET_REACHABLE_CACHED="yes"
     fi
 
-    if ! command -v make >/dev/null 2>&1 || ! command -v gcc >/dev/null 2>&1; then
-        if [ "${NET_REACHABLE_CACHED}" = "yes" ]; then
+    if ! command -v make >/dev/null 2>&1 || ! command -v gcc >/dev/null 2>&1 || ! command -v g++ >/dev/null 2>&1; then
+        if [ "${SKIP_SYSTEM_APT}" = "true" ]; then
+            log_warn "--skip-system-apt 生效：跳过 build-essential (make/gcc/g++) apt安装"
+            log_info "  如果后续CUDA编译失败，请手动执行：sudo apt-get install -y build-essential"
+        elif [ "${NET_REACHABLE_CACHED}" = "yes" ]; then
             log_info "安装 build-essential (make/gcc/g++)"
             run_apt_safe update || true
             run_apt_safe install -y --no-install-recommends build-essential || true
@@ -453,7 +467,20 @@ check_nvidia_driver() {
         save_raw nvidia_smi_initial nvidia-smi
         return 0
     fi
-    log_warn "未检测到 nvidia-smi，开始自动安装 NVIDIA 驱动..."
+    log_warn "未检测到 nvidia-smi..."
+
+    if [ "${SKIP_SYSTEM_APT}" = "true" ]; then
+        log_warn "--skip-system-apt 生效：跳过 apt 驱动自动安装"
+        log_error "请手动安装 NVIDIA 驱动，任选其一："
+        echo "  方案A（.run直装，推荐源坏时用）:"
+        echo "    去 https://www.nvidia.com/Download/index.aspx 下载对应型号 .run"
+        echo "    sudo systemctl stop gdm3 2>/dev/null; sudo sh NVIDIA-Linux-*.run --dkms; sudo reboot"
+        echo "  方案B（修好apt后执行）:"
+        echo "    sudo ubuntu-drivers autoinstall && sudo reboot"
+        return 1
+    fi
+
+    log_info "开始自动安装 NVIDIA 驱动..."
     log_info "（若自动失败，手动执行: sudo ubuntu-drivers autoinstall && sudo reboot）"
 
     if [ "${NET_REACHABLE_CACHED}" != "yes" ]; then
@@ -498,6 +525,18 @@ check_nvidia_driver() {
 # ==================== 顺序16: install_cuda_toolkit() ====================
 install_cuda_toolkit() {
     log_info "===== CUDA Toolkit 检查/安装 ====="
+    if [ "${SKIP_CUDA}" = "true" ]; then
+        log_info "--skip-cuda 生效：跳过 CUDA Toolkit 下载/安装"
+        if command -v nvcc >/dev/null 2>&1; then
+            log_ok "检测到已有 nvcc，继续编译 samples"
+            compile_cuda_samples
+        else
+            log_warn "未检测到 nvcc，后续 CUDA 相关子测试会自动跳过"
+            mkdir -p "${OUTPUT_DIR}/cuda_samples_bin"
+            echo "${OUTPUT_DIR}/cuda_samples_bin" > "${CUDA_BIN_DIR_FILE}"
+        fi
+        return 0
+    fi
     if command -v nvcc >/dev/null 2>&1; then
         local nv_ver
         nv_ver="$(nvcc --version 2>/dev/null | grep -E 'release [0-9]' | head -n1 || echo unknown)"
@@ -512,6 +551,12 @@ install_cuda_toolkit() {
     local INSTALLED_OK=false
 
     if [ "${NET_REACHABLE_CACHED}" != "yes" ]; then
+        # 尝试探测一次网络
+        if check_net_reachable; then
+            NET_REACHABLE_CACHED="yes"
+        fi
+    fi
+    if [ "${NET_REACHABLE_CACHED}" != "yes" ]; then
         log_warn "网络不可达，跳过CUDA自动安装（可手动下载runfile后执行）"
         log_info "手动命令: wget ${CUDA_URL} && sudo sh ${CUDA_RUNFILE} --silent --toolkit"
         mkdir -p "${OUTPUT_DIR}/cuda_samples_bin"
@@ -519,11 +564,14 @@ install_cuda_toolkit() {
         return 1
     fi
 
-    log_info "尝试方式1: 下载 CUDA runfile ${CUDA_RUNFILE}"
+    # ── 方式1 优先：CUDA runfile 直装（不依赖系统 apt 源，404场景也能走通）──
+    log_info "方式1（优先）: 下载 CUDA runfile ${CUDA_RUNFILE} 直装"
     if command -v wget >/dev/null 2>&1; then
         ( cd /tmp && wget -q --show-progress "${CUDA_URL}" -O "/tmp/${CUDA_RUNFILE}" ) 2>&1 | tee -a "${LOG_FILE}" || true
     elif command -v curl >/dev/null 2>&1; then
         ( cd /tmp && curl -fsSL -o "/tmp/${CUDA_RUNFILE}" "${CUDA_URL}" ) 2>&1 | tee -a "${LOG_FILE}" || true
+    else
+        log_error "wget/curl 都不存在，runfile下载失败"
     fi
 
     if [ -f "/tmp/${CUDA_RUNFILE}" ] && [ -s "/tmp/${CUDA_RUNFILE}" ]; then
@@ -536,8 +584,9 @@ install_cuda_toolkit() {
         fi
     fi
 
-    if [ "${INSTALLED_OK}" = "false" ]; then
-        log_info "尝试方式2: cuda-keyring.deb + apt 安装 cuda-toolkit-12-6-1"
+    # ── 方式2 fallback：cuda-keyring.deb + apt（只有 SKIP_SYSTEM_APT=false 才尝试）──
+    if [ "${INSTALLED_OK}" = "false" ] && [ "${SKIP_SYSTEM_APT}" = "false" ]; then
+        log_info "方式2（fallback）: cuda-keyring.deb + apt 安装 cuda-toolkit-12-6-1"
         if command -v wget >/dev/null 2>&1; then
             wget -q "${CUDA_KEYRING_URL}" -O /tmp/cuda-keyring.deb 2>&1 | tee -a "${LOG_FILE}" || true
         elif command -v curl >/dev/null 2>&1; then
@@ -552,6 +601,8 @@ install_cuda_toolkit() {
                 log_ok "CUDA apt 安装成功"
             fi
         fi
+    elif [ "${INSTALLED_OK}" = "false" ] && [ "${SKIP_SYSTEM_APT}" = "true" ]; then
+        log_warn "--skip-system-apt 生效：跳过 apt 方式安装 CUDA"
     fi
 
     export PATH="/usr/local/cuda/bin:${PATH}"
@@ -566,17 +617,19 @@ install_cuda_toolkit() {
         compile_cuda_samples
     else
         log_error "CUDA Toolkit 自动安装失败，请手动执行："
-        echo "  # 方式1 runfile（推荐）"
+        echo "  # 方式1 runfile（推荐 ✨ apt源404时也能用）"
         echo "  wget ${CUDA_URL}"
         echo "  sudo sh ${CUDA_RUNFILE} --silent --toolkit --samples --samplespath=/usr/local/cuda/samples --override"
         echo ""
-        echo "  # 方式2 apt"
+        echo "  # 方式2 apt（apt源可用时用）"
         echo "  wget ${CUDA_KEYRING_URL}"
         echo "  sudo dpkg -i cuda-keyring_1.1-1_all.deb && sudo apt-get update"
         echo "  sudo apt-get install -y cuda-toolkit-12-6-1"
         mkdir -p "${OUTPUT_DIR}/cuda_samples_bin"
         echo "${OUTPUT_DIR}/cuda_samples_bin" > "${CUDA_BIN_DIR_FILE}"
+        return 1
     fi
+    return 0
 }
 
 # ==================== 顺序17: compile_cuda_samples() ====================
@@ -625,9 +678,27 @@ compile_cuda_samples() {
 # ==================== 顺序18: install_dcgm() ====================
 install_dcgm() {
     log_info "===== NVIDIA DCGM 检查/安装 ====="
+    if [ "${SKIP_DCGM}" = "true" ]; then
+        log_info "--skip-dcgm 生效：跳过 DCGM 安装"
+        if command -v dcgmi >/dev/null 2>&1; then
+            log_ok "检测到已有 dcgmi，继续使用"
+            return 0
+        fi
+        return 1
+    fi
     if command -v dcgmi >/dev/null 2>&1; then
         log_ok "dcgmi 已就绪: $(dcgmi --version 2>/dev/null | head -n1 || echo unknown)"
         return 0
+    fi
+
+    if [ "${SKIP_SYSTEM_APT}" = "true" ]; then
+        log_warn "--skip-system-apt 生效：跳过 DCGM apt 安装"
+        log_info "如需手动安装 DCGM，执行以下4行："
+        echo "  curl -fsSL https://nvidia.github.io/dcgm/gpgkey.pub | sudo gpg --dearmor -o /usr/share/keyrings/dcgm-archive-keyring.gpg"
+        echo "  curl -fsSL https://nvidia.github.io/dcgm/ubuntu2404/x86_64/dcgm.list | sudo tee /etc/apt/sources.list.d/dcgm.list"
+        echo "  sudo apt-get update && sudo apt-get install -y datacenter-gpu-manager"
+        echo "  sudo systemctl enable --now nvidia-dcgm.service"
+        return 1
     fi
 
     if [ "${NET_REACHABLE_CACHED}" != "yes" ]; then
@@ -672,7 +743,9 @@ install_dcgm() {
         echo "  curl -fsSL ${list_url} | sudo tee /etc/apt/sources.list.d/dcgm.list"
         echo "  sudo apt-get update && sudo apt-get install -y datacenter-gpu-manager"
         echo "  sudo systemctl enable --now nvidia-dcgm.service"
+        return 1
     fi
+    return 0
 }
 
 # ==================== 顺序19: install_factory_tools() ====================
@@ -721,7 +794,10 @@ install_factory_tools() {
     NET_REACHABLE_CACHED="${net_ok}"
 
     local skip_download=false
-    if [ "${have_downloader}" = "false" ] || [ "${net_ok}" = "false" ]; then
+    if [ "${SKIP_TOOLS_BUILD}" = "true" ]; then
+        skip_download=true
+        log_warn "--skip-tools-build 生效：跳过 gpu-burn / cuda_memtest 下载编译"
+    elif [ "${have_downloader}" = "false" ] || [ "${net_ok}" = "false" ]; then
         skip_download=true
         log_warn "下载条件不满足(have_downloader=${have_downloader}, net_ok=${net_ok})，跳过工具源码编译"
         log_info "恢复条件后手动执行: sudo apt-get install -y git wget curl build-essential && 重新跑脚本"
@@ -734,6 +810,10 @@ install_factory_tools() {
     elif [ -f "${GB_DIR}/gpu_burn" ]; then
         cp "${GB_DIR}/gpu_burn" "${FACTORY_BIN}/" 2>/dev/null || true
         status_gpu_burn="OK"
+    elif ! command -v g++ >/dev/null 2>&1; then
+        log_warn "g++ 不存在，跳过 gpu-burn 编译（如需请手动安装 build-essential）"
+    elif ! command -v nvcc >/dev/null 2>&1; then
+        log_warn "nvcc 不存在，跳过 gpu-burn 编译（需先装 CUDA Toolkit）"
     elif [ "${skip_download}" = "false" ]; then
         local gb_ok=false
         if command -v git >/dev/null 2>&1; then
@@ -770,6 +850,10 @@ install_factory_tools() {
     elif [ -f "${CM_DIR}/cuda_memtest" ]; then
         cp "${CM_DIR}/cuda_memtest" "${FACTORY_BIN}/" 2>/dev/null || true
         status_cuda_memtest="OK"
+    elif ! command -v g++ >/dev/null 2>&1; then
+        log_warn "g++ 不存在，跳过 cuda_memtest 编译（如需请手动安装 build-essential）"
+    elif ! command -v nvcc >/dev/null 2>&1; then
+        log_warn "nvcc 不存在，跳过 cuda_memtest 编译（需先装 CUDA Toolkit）"
     elif [ "${skip_download}" = "false" ]; then
         local cm_ok=false
         if command -v git >/dev/null 2>&1; then
@@ -809,15 +893,30 @@ install_factory_tools() {
 enumerate_gpus() {
     log_info "===== GPU 枚举（门禁，软着陆版本）====="
     local GPU_COUNT=0
-    GPU_COUNT="$(nvidia-smi --query-gpu=count --format=csv,noheader 2>/dev/null | head -n1 || echo 0)"
-    [ "${GPU_COUNT}" = "count" ] && GPU_COUNT=0
-    if [ "${GPU_COUNT}" -eq 0 ] || ! [ "${GPU_COUNT}" -eq "${GPU_COUNT}" ] 2>/dev/null; then
+    local _raw
+    _raw="$(nvidia-smi --query-gpu=count --format=csv,noheader 2>/dev/null | head -n1 || echo "")"
+    # 归一化：去掉空格、表头、非数字
+    _raw="$(echo "${_raw}" | tr -d '[:space:]')"
+    if [ -z "${_raw}" ] || [ "${_raw}" = "count" ] || ! [[ "${_raw}" =~ ^[0-9]+$ ]]; then
+        GPU_COUNT=0
+    else
+        GPU_COUNT="${_raw}"
+    fi
+    # 二次校验：数字合法性（防止 -eq 段错误）
+    if ! [ "${GPU_COUNT}" -eq "${GPU_COUNT}" ] 2>/dev/null; then
+        GPU_COUNT=0
+    fi
+    if [ "${GPU_COUNT}" -eq 0 ]; then
         local alt
         alt="$(nvidia-smi -L 2>/dev/null | wc -l || echo 0)"
-        [ "${alt}" -gt 0 ] && GPU_COUNT="${alt}"
+        # 确保 alt 也是合法数字
+        if ! [[ "${alt}" =~ ^[0-9]+$ ]]; then alt=0; fi
+        [ "${alt}" -gt 0 ] 2>/dev/null && GPU_COUNT="${alt}"
     fi
+    # 最终兜底
+    if ! [[ "${GPU_COUNT}" =~ ^[0-9]+$ ]]; then GPU_COUNT=0; fi
 
-    if [ "${GPU_COUNT}" -eq 0 ]; then
+    if [ "${GPU_COUNT}" -eq 0 ] 2>/dev/null; then
         log_error "======================================"
         log_error "❌ GPU 枚举报错: nvidia-smi 可执行但返回0块GPU"
         log_error "======================================"
@@ -897,6 +996,10 @@ write_failure_report() {
     "TEMP_ALARM_C": ${TEMP_ALARM_C},
     "TEMP_COOLDOWN_C": ${TEMP_COOLDOWN_C},
     "SKIP_INSTALL": ${SKIP_INSTALL},
+    "SKIP_SYSTEM_APT": ${SKIP_SYSTEM_APT},
+    "SKIP_CUDA": ${SKIP_CUDA},
+    "SKIP_DCGM": ${SKIP_DCGM},
+    "SKIP_TOOLS_BUILD": ${SKIP_TOOLS_BUILD},
     "STRESS_ONLY": ${STRESS_ONLY}
   },
   "error_summary": "驱动未加载或nvidia-smi返回0块GPU。按顺序排查：1) BIOS关闭Secure Boot 2) sudo apt-get install linux-headers-$(uname -r) dkms 3) sudo ubuntu-drivers autoinstall 4) 必须sudo reboot后重跑",
@@ -1446,6 +1549,10 @@ generate_final_report() {
     "TEMP_ALARM_C": ${TEMP_ALARM_C},
     "TEMP_COOLDOWN_C": ${TEMP_COOLDOWN_C},
     "SKIP_INSTALL": ${SKIP_INSTALL},
+    "SKIP_SYSTEM_APT": ${SKIP_SYSTEM_APT},
+    "SKIP_CUDA": ${SKIP_CUDA},
+    "SKIP_DCGM": ${SKIP_DCGM},
+    "SKIP_TOOLS_BUILD": ${SKIP_TOOLS_BUILD},
     "STRESS_ONLY": ${STRESS_ONLY}
   },
   "gpus_found_from_lspci": "$(lspci 2>/dev/null | grep -i nvidia | wc -l || echo 0)",
@@ -1478,6 +1585,10 @@ main() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --skip-install)     SKIP_INSTALL=true; shift ;;
+            --skip-system-apt)  SKIP_SYSTEM_APT=true; shift ;;
+            --skip-cuda)        SKIP_CUDA=true; shift ;;
+            --skip-dcgm)        SKIP_DCGM=true; shift ;;
+            --skip-tools-build) SKIP_TOOLS_BUILD=true; shift ;;
             --stress-only)      STRESS_ONLY=true; shift ;;
             --field-level)      FIELD_LEVEL="$2"; shift 2 ;;
             --field-level=*)    FIELD_LEVEL="${1#*=}"; shift ;;
@@ -1486,12 +1597,22 @@ main() {
             --force-fieldiag)   FORCE_FIELDIAG=true; shift ;;
             -h|--help)
                 echo "用法: $0 [选项]"
-                echo "  --skip-install       跳过依赖/驱动/CUDA/DCGM下载安装（只跑测试）"
+                echo "  --skip-install       跳过所有安装步骤（仅测试，假设依赖已就位）"
+                echo "  --skip-system-apt    只跳过 apt 系统依赖/驱动安装（CUDA runfile/DCGM/工具编译仍执行）"
+                echo "                       ✨ 适合 apt 源404崩溃或系统源不可用的场景"
+                echo "  --skip-cuda          跳过 CUDA Toolkit 下载安装（已手动装好时用）"
+                echo "  --skip-dcgm          跳过 DCGM 安装"
+                echo "  --skip-tools-build   跳过 gpu-burn / cuda_memtest 源码编译"
                 echo "  --stress-only        仅执行依赖/驱动/枚举/压力+报告（快速模式）"
                 echo "  --field-level N      fieldiag 诊断级别 0~3（默认1）"
                 echo "  --gpuburn-time N     gpu-burn 秒数（默认120）"
                 echo "  --force-fieldiag     跳过 fieldiag 预检直接跑主级别"
                 echo "  -h, --help           显示此帮助"
+                echo ""
+                echo "典型场景："
+                echo "  场景1 - apt源崩溃404但有网：  $0 --skip-system-apt"
+                echo "  场景2 - 驱动/CUDA已装好：      $0 --skip-system-apt --skip-cuda"
+                echo "  场景3 - 所有工具都已就位：      $0 --skip-install"
                 exit 0
                 ;;
             *)
@@ -1502,7 +1623,7 @@ main() {
     done
     set -- "${positional[@]}"
 
-    if [ "$#" -eq 0 ] && [ "${SKIP_INSTALL}" = "false" ] && [ "${STRESS_ONLY}" = "false" ] && [ "${FIELD_LEVEL}" = "1" ] && [ "${GPUBURN_DURATION_SEC}" = "120" ] && [ "${FORCE_FIELDIAG}" = "false" ]; then
+    if [ "$#" -eq 0 ] && [ "${SKIP_INSTALL}" = "false" ] && [ "${SKIP_SYSTEM_APT}" = "false" ] && [ "${SKIP_CUDA}" = "false" ] && [ "${SKIP_DCGM}" = "false" ] && [ "${SKIP_TOOLS_BUILD}" = "false" ] && [ "${STRESS_ONLY}" = "false" ] && [ "${FIELD_LEVEL}" = "1" ] && [ "${GPUBURN_DURATION_SEC}" = "120" ] && [ "${FORCE_FIELDIAG}" = "false" ]; then
         interactive_menu
     fi
 
@@ -1512,7 +1633,8 @@ main() {
     log_info "输出目录 : ${OUTPUT_DIR}"
     log_info "日志文件 : ${LOG_FILE}"
     log_info "配置: stress=${STRESS_DURATION_SEC}s  gpuburn=${GPUBURN_DURATION_SEC}s  fieldiag=L${FIELD_LEVEL}  temp_alarm=${TEMP_ALARM_C}°C"
-    log_info "开关: skip_install=${SKIP_INSTALL}  stress_only=${STRESS_ONLY}  force_fieldiag=${FORCE_FIELDIAG}"
+    log_info "开关: skip_install=${SKIP_INSTALL}  skip_system_apt=${SKIP_SYSTEM_APT}  skip_cuda=${SKIP_CUDA}  skip_dcgm=${SKIP_DCGM}  skip_tools_build=${SKIP_TOOLS_BUILD}"
+    log_info "开关: stress_only=${STRESS_ONLY}  force_fieldiag=${FORCE_FIELDIAG}"
     log_info "======================================"
 
     cat > "${RUN_CONFIG_FILE}" <<EOF
@@ -1524,6 +1646,10 @@ run_config:
   temp_alarm_c: ${TEMP_ALARM_C}
   temp_cooldown_c: ${TEMP_COOLDOWN_C}
   skip_install: ${SKIP_INSTALL}
+  skip_system_apt: ${SKIP_SYSTEM_APT}
+  skip_cuda: ${SKIP_CUDA}
+  skip_dcgm: ${SKIP_DCGM}
+  skip_tools_build: ${SKIP_TOOLS_BUILD}
   stress_only: ${STRESS_ONLY}
   force_fieldiag: ${FORCE_FIELDIAG}
   output_dir: "${OUTPUT_DIR}"
