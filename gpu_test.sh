@@ -347,8 +347,10 @@ check_system() {
     if [ -f /etc/os-release ]; then
         source /etc/os-release
         log_info "操作系统: ${PRETTY_NAME}"
-        if [[ "${VERSION_ID}" != "24.04" ]]; then
-            log_warn "当前非 Ubuntu 24.04，脚本会尝试继续执行，但不保证完全兼容"
+        if [[ "${VERSION_ID}" =~ ^24\. ]]; then
+            log_ok "Ubuntu ${VERSION_ID}（24.x 系列），完全兼容"
+        else
+            log_warn "当前非 Ubuntu 24.x 系列，脚本会尝试继续执行，但不保证完全兼容"
         fi
     fi
 
