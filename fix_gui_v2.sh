@@ -1,6 +1,13 @@
 #!/bin/bash
 set +e
 
+[ -x "$0" ] || chmod +x "$0" 2>/dev/null
+
+if [ "$(id -u)" -ne 0 ]; then
+    sudo bash "$0" "$@"
+    exit $?
+fi
+
 LOG="/workspace/fix_gui_v2_$(date +%Y%m%d_%H%M%S).log"
 
 log(){ echo "[$(date '+%H:%M:%S')] $*" | tee -a "${LOG}"; }
@@ -10,15 +17,10 @@ log_warn(){ log "[WARN] $*"; }
 log_error(){ log "[ERR]  $*"; }
 
 log "============================================"
-log " 安全版 GUI 恢复 + GRUB 修复"
-log " 本脚本不会重启 gdm3，不会杀掉你的终端"
+log " 一键 GUI 恢复 + GRUB 修复"
+log " 用法: bash $0  或  ./$0"
 log " 日志: ${LOG}"
 log "============================================"
-
-if [ "$(id -u)" -ne 0 ]; then
-    log "需要 root 权限，正在 sudo..."
-    exec sudo bash "$0" "$@"
-fi
 
 log_info "[1/10] 清理 APT/dpkg 锁..."
 rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/debconf/config.dat.lock 2>/dev/null
