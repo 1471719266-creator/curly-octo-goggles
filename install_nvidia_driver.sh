@@ -7,7 +7,9 @@ if [ "$(id -u)" -ne 0 ]; then
     exec sudo bash "$0" "$@"
 fi
 
-LOG="/workspace/install_driver_$(date +%Y%m%d_%H%M%S).log"
+LOGDIR="/workspace"
+mkdir -p "${LOGDIR}"
+LOG="${LOGDIR}/install_driver_$(date +%Y%m%d_%H%M%S).log"
 touch "${LOG}"
 
 log() { echo "[$(date '+%H:%M:%S')] $*" | tee -a "${LOG}"; }
@@ -23,118 +25,114 @@ log "============================================"
 
 # 检查是否已安装
 if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L 2>/dev/null | grep -q 'GPU'; then
-    log_ok "NVIDIA 驱动已安装且正常工作"
+    log_ok "NVIDIA 驱动已安装且正常"
     nvidia-smi 2>/dev/null | head -10 | tee -a "${LOG}"
-    log "无需重复安装，退出"
+    log "无需重复安装"
     exit 0
 fi
 
 CODENAME="$(grep -E '^VERSION_CODENAME=' /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"' || echo 'noble')"
-log_info "Ubuntu 版本代号: ${CODENAME}"
+log_info "Ubuntu 版本: ${CODENAME}"
+log_info "当前内核: $(uname -r)"
 
-log_info "[1/9] 清理 APT/dpkg 锁..."
-rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/debconf/config.dat.lock 2>/dev/null
+# ---- 第1步：清理 ----
+log_info "[1/8] 清理 APT 锁..."
+rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock 2>/dev/null
 dpkg --configure -a 2>/dev/null || true
+apt-get install -f -y 2>/dev/null || true
 
-log_info "[2/9] 清理旧 NVIDIA/CUDA 源..."
-rm -f /etc/apt/sources.list.d/*nvidia* /etc/apt/sources.list.d/*cuda* /etc/apt/sources.list.d/*dcgm* 2>/dev/null
-sed -i '/download\.nvidia\.com\|nobleoper/d' /etc/apt/sources.list 2>/dev/null
+# ---- 第2步：重建软件源 ----
+log_info "[2/8] 配置软件源..."
+cat > /etc/apt/sources.list << 'SOURCES'
+deb https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ noble main restricted universe multiverse
+deb https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ noble-updates main restricted universe multiverse
+deb https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ noble-backports main restricted universe multiverse
+deb http://security.ubuntu.com/ubuntu/ noble-security main restricted universe multiverse
+SOURCES
 
-log_info "[3/9] 重建 sources.list..."
-cat > /etc/apt/sources.list << EOF
-deb https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ ${CODENAME} main restricted universe multiverse
-deb https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ ${CODENAME}-updates main restricted universe multiverse
-deb https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ ${CODENAME}-backports main restricted universe multiverse
-deb http://security.ubuntu.com/ubuntu/ ${CODENAME}-security main restricted universe multiverse
-EOF
-if ! (echo > /dev/tcp/mirrors.tuna.tsinghua.edu.cn/443) 2>/dev/null; then
-    cat > /etc/apt/sources.list << EOF
-deb http://archive.ubuntu.com/ubuntu/ ${CODENAME} main restricted universe multiverse
-deb http://archive.ubuntu.com/ubuntu/ ${CODENAME}-updates main restricted universe multiverse
-deb http://archive.ubuntu.com/ubuntu/ ${CODENAME}-backports main restricted universe multiverse
-deb http://security.ubuntu.com/ubuntu/ ${CODENAME}-security main restricted universe multiverse
-EOF
+# ---- 第3步：apt update ----
+log_info "[3/8] apt update..."
+rm -rf /var/lib/apt/lists/* 2>/dev/null
+apt-get update -q 2>&1 | tee -a "${LOG}"
+if [ $? -ne 0 ]; then
+    log_warn "apt update 有报错，继续..."
 fi
 
-log_info "[4/9] apt update..."
-rm -rf /var/lib/apt/lists/* 2>/dev/null
-mkdir -p /var/lib/apt/lists/partial 2>/dev/null
-apt-get update -q -o Acquire::Retries=3 2>&1 | tee -a "${LOG}" || {
-    dpkg --configure -a 2>/dev/null || true
-    apt-get install -f -y --fix-broken 2>/dev/null || true
-    apt-get update -q 2>&1 | tee -a "${LOG}" || log_warn "apt update 仍失败"
-}
+# ---- 第4步：安装基础依赖 ----
+log_info "[4/8] 安装基础依赖 (dkms, build-essential)..."
+apt-get install -y dkms build-essential linux-headers-$(uname -r) pciutils 2>&1 | tee -a "${LOG}"
+if ! command -v dkms >/dev/null 2>&1; then
+    log_error "dkms 安装失败！无法继续"
+    log_error "请检查网络连接后重试"
+    exit 1
+fi
+log_ok "dkms 安装成功"
 
-log_info "[5/9] 扫描所有内核..."
+# ---- 第5步：扫描所有内核，安装头文件 ----
+log_info "[5/8] 安装所有内核头文件..."
 ALL_KVERS="$(ls -d /lib/modules/*/ 2>/dev/null | sed 's|/lib/modules/||;s|/$||' | sort -V)"
 [ -z "${ALL_KVERS}" ] && ALL_KVERS="$(uname -r)"
-echo "${ALL_KVERS}" | while read k; do log_info "  内核: ${k}"; done
-
-log_info "[6/9] 安装内核头文件 + dkms + 编译工具..."
 for KV in ${ALL_KVERS}; do
-    apt-get install -y --no-install-recommends "linux-headers-${KV}" 2>/dev/null || true
+    log_info "  内核: ${KV}"
+    apt-get install -y "linux-headers-${KV}" 2>/dev/null || log_warn "  内核 ${KV} 头文件安装跳过"
 done
-apt-get install -y --no-install-recommends dkms build-essential pciutils ca-certificates 2>&1 | tee -a "${LOG}" || true
 
-log_info "[7/9] 安装 NVIDIA 驱动..."
-DRV_INSTALLED=""
-for DRV in nvidia-driver-595 nvidia-driver-580 nvidia-driver-570 nvidia-driver-560 nvidia-driver-550; do
-    log_info "  尝试 ${DRV}..."
-    apt-get install -y --no-install-recommends "${DRV}" 2>&1 | tee -a "${LOG}" && {
-        DRV_INSTALLED="${DRV}"
-        log_ok "  ${DRV} 安装成功"
-        break
-    }
-    apt-get install -f -y --fix-broken 2>/dev/null || true
-done
-if [ -z "${DRV_INSTALLED}" ]; then
-    log_warn "  APT 驱动安装失败，尝试 ubuntu-drivers autoinstall..."
-    ubuntu-drivers autoinstall 2>&1 | tee -a "${LOG}" || true
-    DRV_INSTALLED="$(ubuntu-drivers devices 2>/dev/null | grep -i recommended | awk '{print $3}' | head -n1 || echo 'unknown')"
-fi
-log_ok "  驱动: ${DRV_INSTALLED}"
+# ---- 第6步：安装 NVIDIA 驱动 ----
+log_info "[6/8] 安装 NVIDIA 驱动..."
 
-# 为所有内核编译模块
-log_info "  为所有内核编译 NVIDIA 模块..."
-for KV in ${ALL_KVERS}; do
-    dkms autoinstall -k "${KV}" 2>&1 | tee -a "${LOG}" || true
-done
-depmod -a 2>/dev/null || true
-
-log_info "[8/9] 禁用 nouveau + 持久化配置..."
-mkdir -p /etc/modprobe.d
-cat > /etc/modprobe.d/blacklist-nouveau.conf << 'EOF'
-blacklist nouveau
-options nouveau modeset=0
-EOF
-cat > /etc/modprobe.d/nvidia.conf << 'EOF'
-options nvidia NVreg_EnableGpuFirmware=0
-EOF
-
-log_info "[9/9] 重建 initrd + 更新 GRUB..."
-for KV in ${ALL_KVERS}; do
-    if [ -f "/boot/initrd.img-${KV}" ]; then
-        update-initramfs -u -k "${KV}" 2>/dev/null || true
-    else
-        update-initramfs -c -k "${KV}" 2>/dev/null || true
-    fi
-done
-update-grub 2>&1 | tee -a "${LOG}" || grub-mkconfig -o /boot/grub/grub.cfg 2>/dev/null || true
-
-# 尝试加载模块
-modprobe nvidia 2>/dev/null || true
-modprobe nvidia_modeset nvidia_uvm nvidia_drm 2>/dev/null || true
-
-log ""
-log "============================================"
+# 先尝试 ubuntu-drivers autoinstall (最可靠)
+log_info "  尝试 ubuntu-drivers autoinstall..."
+ubuntu-drivers autoinstall 2>&1 | tee -a "${LOG}"
 if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L 2>/dev/null | grep -q 'GPU'; then
-    log_ok "驱动安装成功！"
-    nvidia-smi 2>/dev/null | head -10 | tee -a "${LOG}"
-    log ""
-    log "现在可以运行测试脚本: ./gpu_test.sh"
+    log_ok "ubuntu-drivers 安装成功！"
 else
-    log_warn "驱动已安装，但需要重启才能生效"
-    log_warn "请执行: sudo reboot"
-    log_warn "重启后再运行测试脚本: ./gpu_test.sh"
+    # 尝试 apt 直接安装
+    log_info "  尝试 apt 直接安装..."
+    for DRV in nvidia-driver-595 nvidia-driver-580 nvidia-driver-570 nvidia-driver-560 nvidia-driver-550 nvidia-driver-545 nvidia-driver-535; do
+        log_info "    尝试 ${DRV}..."
+        apt-get install -y --no-install-recommends "${DRV}" 2>&1 | tee -a "${LOG}"
+        if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L 2>/dev/null | grep -q 'GPU'; then
+            log_ok "    ${DRV} 安装成功！"
+            break
+        fi
+        apt-get install -f -y 2>/dev/null || true
+    done
 fi
-log "============================================"
+
+# ---- 第7步：加载驱动 ----
+log_info "[7/8] 加载 NVIDIA 模块..."
+modprobe nvidia 2>/dev/null || true
+modprobe nvidia_modeset 2>/dev/null || true
+modprobe nvidia_uvm 2>/dev/null || true
+sleep 2
+
+# 如果 lsmod 没有 nvidia，尝试 dkms 编译
+if ! lsmod 2>/dev/null | grep -q '^nvidia'; then
+    log_info "  尝试 dkms autoinstall..."
+    dkms autoinstall 2>&1 | tee -a "${LOG}" || true
+    modprobe nvidia 2>/dev/null || true
+    sleep 1
+fi
+
+# ---- 第8步：验证结果 ----
+log_info "[8/8] 验证..."
+log ""
+
+if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L 2>/dev/null | grep -q 'GPU'; then
+    log_ok "============================================"
+    log_ok " NVIDIA 驱动安装成功！"
+    log_ok "============================================"
+    nvidia-smi 2>/dev/null | tee -a "${LOG}"
+    log ""
+    log "现在可以运行: ./gpu_test.sh"
+else
+    log_warn "============================================"
+    log_warn " 驱动安装完成但 GPU 未检测到"
+    log_warn " 需要重启生效，请执行:"
+    log_warn "   sudo reboot"
+    log_warn " 重启后验证:"
+    log_warn "   nvidia-smi"
+    log_warn " 如果 nvidia-smi 仍不行，手动装:"
+    log_warn "   sudo ubuntu-drivers autoinstall"
+    log_warn "============================================"
+fi
